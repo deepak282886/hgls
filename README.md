@@ -1,4 +1,15 @@
 # Hierarchical Generative Learning System (HGLS)
+
+### Current Probe - 
+
+'i brush'  →  'i brush my teeth'
+'when i sleep'  →  'when i sleep early i wake up happy'
+'i love amma'  →  'i love amma then early'
+'when i tell the truth'  →  'when i tell the truth i feel proud'
+'i share'  →  'i share my food'
+'when i help'  →  'when i help amma she smiles'
+'i go to school'  →  'i go to school so i wash my hands and i help my friend'
+
 ### Version 0.4 — Little Deepak Edition
 
 A system that grows hierarchical generative knowledge using a single uniform learning algorithm, starting from keyboard characters and building upward through curriculum-controlled developmental stages.
