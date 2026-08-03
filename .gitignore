@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.*
+*.env
+
+# API keys
+secrets.py
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+.hgls/
+
+# Memory / saved state
+deepak_memory.json
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Distribution
+dist/
+build/
+*.egg-info/
