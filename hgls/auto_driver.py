@@ -177,6 +177,17 @@ class AutoDriver:
                     self._current_input = None
                     return
 
+                # Skip truncated inputs — end mid-word or too short
+                words = user_input.strip().split()
+                if len(words) < 3:
+                    self._current_input = None
+                    return
+                last = words[-1].rstrip('.,!?')
+                if last in ('do', 'is', 'are', 'how', 'what', 'the',
+                            'a', 'an', 'and', 'or', 'but', 'your', 'me'):
+                    self._current_input = None
+                    return
+
                 self._attempt_count += 1
 
                 # 2. Get Deepak's response
@@ -287,16 +298,21 @@ class AutoDriver:
     ) -> tuple:
         """
         Ask the LLM parent to evaluate Deepak's response.
+        Strict check: does the response actually answer the question?
         Returns (is_good, corrected_text_or_None).
         """
         prompt = (
             f"Someone said to Little Deepak: '{user_input}'\n"
             f"Little Deepak replied: '{response}'\n\n"
-            f"Is this a natural, correct, age-appropriate reply for a "
-            f"good 5-year-old Indian child?\n\n"
-            f"If YES: reply with just 'good'\n"
-            f"If NO: reply with 'bad: ' followed by what Little Deepak "
-            f"should have said instead. Keep it simple and in his voice."
+            f"Rules:\n"
+            f"- A greeting ('hi', 'namaste') is ONLY correct if the input was also a greeting\n"
+            f"- If the input asks a question, the reply must answer it\n"
+            f"- A generic greeting as a reply to a question is WRONG\n"
+            f"- Repeating the input back is WRONG\n\n"
+            f"If the reply correctly answers what was said: reply with just 'good'\n"
+            f"If the reply is wrong or ignores the question: reply with "
+            f"'bad: ' followed by what Little Deepak should have said. "
+            f"Keep it simple, 1 sentence, in his voice."
         )
 
         try:
@@ -331,6 +347,7 @@ class AutoDriver:
     def _apply_correction(self, bad: str, good: str) -> None:
         """
         Penalise the bad response and learn the corrected one.
+        Also stores as a QA pair so the composer finds it next time.
         """
         from hgls.structures import GenerativeStructure
         level = self.system.curriculum.get_active_level()
@@ -344,8 +361,14 @@ class AutoDriver:
         )
         self.system.library.add_failure(bad_struct)
 
-        # Learn the corrected version
+        # Learn the corrected version into the library
         self.system.run_cycle(good)
+
+        # Store as QA pair in the composer so it's found directly next time
+        if hasattr(self.system, 'composer') and self._current_input:
+            self.system.composer.add_learned_answer(
+                self._current_input, good
+            )
 
     # ── Logging ───────────────────────────────────────────────────
 

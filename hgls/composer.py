@@ -47,12 +47,22 @@ class ResponseComposer:
     def __init__(self, library: Library, curriculum: CurriculumController):
         self.library    = library
         self.curriculum = curriculum
+        self._qa_pairs: dict = {}   # question → learned answer from corrections
+
+    def add_learned_answer(self, question: str, answer: str) -> None:
+        """Store a correction as a direct question→answer pair."""
+        self._qa_pairs[question.lower().strip()] = answer.lower().strip()
 
     # ── Public ────────────────────────────────────────────────────
 
     def compose(self, user_input: str) -> str:
         """Compose a response to user_input from library structures."""
         text = user_input.lower().strip().rstrip('?!.')
+
+        # Check learned QA pairs first — corrections take priority
+        qa_answer = self._find_qa_answer(text)
+        if qa_answer:
+            return qa_answer
 
         # Handle greetings and farewells directly
         words = set(text.split())
@@ -82,6 +92,25 @@ class ResponseComposer:
             return self._default_response(content_words)
 
         return self._format(parts)
+
+    # ── QA lookup ─────────────────────────────────────────────────
+
+    def _find_qa_answer(self, text: str) -> Optional[str]:
+        """
+        Check if we have a learned answer for this input.
+        Uses fuzzy matching so slight rephrasing still finds the answer.
+        """
+        from difflib import SequenceMatcher
+        best_score  = 0.0
+        best_answer = None
+        for question, answer in self._qa_pairs.items():
+            score = SequenceMatcher(None, text, question).ratio()
+            if score > best_score:
+                best_score  = score
+                best_answer = answer
+        if best_score >= 0.65:
+            return best_answer
+        return None
 
     # ── Assembly ──────────────────────────────────────────────────
 
