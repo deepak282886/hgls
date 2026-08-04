@@ -111,9 +111,11 @@ class HGLSystem:
 
     # ── Main loop ─────────────────────────────────────────────────
 
-    def run_cycle(self, raw_input: str) -> Dict[str, Any]:
+    def run_cycle(self, raw_input: str, target_level: int = None) -> Dict[str, Any]:
         """
         Process one input through the full learning cycle.
+        target_level overrides the curriculum stage — used during domain expansion
+        to learn words at level 2, phrases at level 3, schemas at level 4.
         Returns a summary dict.
         """
         self._cycle_count += 1
@@ -127,7 +129,7 @@ class HGLSystem:
         self.memory.push(text)
 
         # 3. Compute salience → hypothesis budget
-        level    = self.curriculum.get_active_level()
+        level    = target_level if target_level is not None else self.curriculum.get_active_level()
         salience = self.attention.compute_salience(text, level)
         n_hyp    = self.attention.allocate_hypotheses(14, salience)
 
@@ -140,13 +142,14 @@ class HGLSystem:
             if outcome == 'success':
                 self.self_model.mark_self_generated(struct)
 
-        # 6. Curriculum tick + advancement check
-        self.curriculum.tick()
+        # 6. Curriculum tick + advancement (only when following curriculum naturally)
         advanced = False
-        if self.curriculum.should_advance(self.library):
-            new_stage = self.curriculum.advance()
-            advanced  = True
-            print(f"\n[Curriculum] *** Advanced to: {new_stage.name} ***\n")
+        if target_level is None:
+            self.curriculum.tick()
+            if self.curriculum.should_advance(self.library):
+                new_stage = self.curriculum.advance()
+                advanced  = True
+                print(f"\n[Curriculum] *** Advanced to: {new_stage.name} ***\n")
 
         # 7. Accelerate LLM decay once the system matures
         if self.llm_parent and self.reward.maturity > 0.5:
@@ -170,11 +173,12 @@ class HGLSystem:
         self,
         inputs: List[str],
         verbose: bool = True,
+        target_level: int = None,
     ) -> List[Dict]:
         """Run a list of inputs as one learning episode."""
         results = []
         for inp in inputs:
-            r = self.run_cycle(inp)
+            r = self.run_cycle(inp, target_level=target_level)
             results.append(r)
             if verbose:
                 self._print_cycle(r)
@@ -238,38 +242,131 @@ class HGLSystem:
 
     def respond(self, user_input: str) -> str:
         """
-        Generate a response to user input by composing library structures.
-        Also learns from the input — every conversation is a learning cycle.
+        Generate a response, then have the LLM parent evaluate it.
+        If the response is wrong, the parent corrects it:
+          - bad response → marked as failure in library
+          - corrected version → learned as new structure
+        Every conversation is a learning opportunity.
         """
         text     = self.sensory_motor.receive_input(user_input)
         response = self.composer.compose(text)
+
+        # LLM parent evaluates and corrects if needed
+        if self.llm_parent and self.llm_parent._active():
+            response = self._parent_correct(text, response)
+
         # Learn from what was said to us
         self.run_cycle(text)
         return response
 
+    def _parent_correct(self, user_input: str, response: str) -> str:
+        """
+        Ask the LLM parent to evaluate Deepak's response.
+        If wrong: mark as failure, propose correction, learn it.
+        If right: reinforce the structures that produced it.
+        """
+        # Ask parent: is this a good response for Little Deepak?
+        context = (
+            f"Someone said to Little Deepak: '{user_input}'. "
+            f"Little Deepak replied: '{response}'. "
+            f"Is this a natural, correct, age-appropriate reply?"
+        )
+        judgment, confidence = self.llm_parent.judge(response, context=context)
+
+        if judgment in ('bad',) and confidence > 0.5:
+            # Response is wrong — ask parent for the correct version
+            correction = self._request_correction(user_input, response)
+            if correction and correction != response:
+                # Mark original response as failure
+                bad_struct = GenerativeStructure(
+                    level=self.curriculum.get_active_level(),
+                    elements=list(response),
+                    source='generated',
+                    fitness=0.0,
+                )
+                self.library.add_failure(bad_struct)
+
+                # Learn the corrected version
+                self.run_cycle(correction)
+                return correction
+
+        return response
+
+    def _request_correction(self, user_input: str, bad_response: str) -> str:
+        """Ask the LLM parent what Little Deepak should have said."""
+        if not self.llm_parent or not self.llm_parent._active():
+            return bad_response
+
+        prompt = (
+            f"Someone said to Little Deepak: '{user_input}'.\n"
+            f"Little Deepak said: '{bad_response}' — this is wrong or unnatural.\n\n"
+            f"Write the correct, natural reply Little Deepak should give. "
+            f"Keep it simple, 1-2 sentences, in Little Deepak's voice. "
+            f"Start with 'i' or 'yes' or 'namaste'. "
+            f"Reply with only the corrected sentence, nothing else."
+        )
+        try:
+            corrected = self.llm_parent._call(prompt, max_tokens=60).strip()
+            # Clean up: lowercase, strip quotes
+            corrected = corrected.lower().strip().strip('"\'')
+            if len(corrected) > 3:
+                return corrected
+        except Exception:
+            pass
+        return bad_response
+
     # ── Persistence ───────────────────────────────────────────────
 
     def save(self, path: str = 'deepak_memory.json') -> None:
-        """Save Little Deepak's entire library to disk."""
+        """
+        Save Little Deepak's library to disk.
+        Writes to a temp file first then renames — prevents corruption
+        if the process is interrupted mid-write.
+        Also keeps a .bak of the previous good save.
+        """
         data = {
             'version':          '0.4',
             'persona':          'Little Deepak',
             'curriculum_stage': int(self.curriculum.current_stage),
             'library':          self.library.to_dict(),
         }
-        with open(path, 'w', encoding='utf-8') as f:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+        # Rotate: current → .bak, tmp → current
+        backup = path + '.bak'
+        if os.path.exists(path):
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(path, backup)
+        os.rename(tmp, path)
         print(f"[Memory] Saved {len(self.library)} structures → {path}")
 
     def load(self, path: str = 'deepak_memory.json') -> bool:
         """
         Load a previously saved library from disk.
-        Returns True if loaded, False if file not found.
+        Returns True if loaded, False if file not found or corrupted.
         """
         if not os.path.exists(path):
             return False
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[Memory] File corrupted ({e}) — checking backup...")
+            backup = path + '.bak'
+            if os.path.exists(backup):
+                try:
+                    with open(backup, encoding='utf-8') as f:
+                        data = json.load(f)
+                    print(f"[Memory] Loaded from backup {backup}")
+                except Exception:
+                    print("[Memory] Backup also corrupted — starting fresh.")
+                    return False
+            else:
+                print("[Memory] No backup found — starting fresh.")
+                return False
 
         # Restore library
         self.library = Library.from_dict(data['library'])

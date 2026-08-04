@@ -23,7 +23,7 @@ import hgls.persona as persona
 TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
 # Together AI model string — verify at https://api.together.ai/models
-MODEL = "togethercomputer/GPT-NeoXT-Chat-Base-20B"
+MODEL = "openai/gpt-oss-20b"
 
 DECAY_RATE   = 0.995
 MIN_STRENGTH = 0.05
