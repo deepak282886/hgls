@@ -177,7 +177,12 @@ class AutoDriver:
                     self._current_input = None
                     return
 
-                # Skip truncated inputs — end mid-word or too short
+                # Skip non-English inputs
+                if not all(ord(c) < 128 for c in user_input):
+                    self._current_input = None
+                    return
+
+                # Skip truncated inputs
                 words = user_input.strip().split()
                 if len(words) < 3:
                     self._current_input = None
@@ -211,19 +216,11 @@ class AutoDriver:
                 if corrected and corrected != response:
                     print(f'  Corrected → {corrected}')
 
-                # 5. Learn from input
-                self.system.run_cycle(
-                    self.system.sensory_motor.receive_input(user_input)
-                )
-
+                # 5. Do NOT learn from the parent's input — that teaches
+                # Deepak to echo questions back. Only learn from corrections.
                 if good:
-                    # Deepak nailed it — move to next topic
                     self._current_input = None
-                else:
-                    # Stay on the same input — try again next turn
-                    # The correction has already been learned, so next
-                    # attempt should produce a better response
-                    pass
+                # else: stay on same input, correction already learned
 
                 # 6. Internal exploration every 10 turns
                 if self._turn % 10 == 0:
@@ -297,24 +294,51 @@ class AutoDriver:
         self, user_input: str, response: str
     ) -> tuple:
         """
-        Ask the LLM parent to evaluate Deepak's response.
-        Strict check: does the response actually answer the question?
-        Returns (is_good, corrected_text_or_None).
+        Evaluate Deepak's response.
+        Programmatic checks first (reliable), then LLM for subtler cases.
         """
-        prompt = (
-            f"Someone said to Little Deepak: '{user_input}'\n"
-            f"Little Deepak replied: '{response}'\n\n"
-            f"Rules:\n"
-            f"- A greeting ('hi', 'namaste') is ONLY correct if the input was also a greeting\n"
-            f"- If the input asks a question, the reply must answer it\n"
-            f"- A generic greeting as a reply to a question is WRONG\n"
-            f"- Repeating the input back is WRONG\n\n"
-            f"If the reply correctly answers what was said: reply with just 'good'\n"
-            f"If the reply is wrong or ignores the question: reply with "
-            f"'bad: ' followed by what Little Deepak should have said. "
-            f"Keep it simple, 1 sentence, in his voice."
-        )
+        # ── Programmatic checks (no LLM needed) ──────────────────
 
+        # Fail: Deepak echoed the parent's question back
+        if len(user_input) > 10 and user_input.lower()[:20] in response.lower():
+            correction = self._request_correction(user_input, response)
+            self._record_fail(user_input, response, correction)
+            return False, correction
+
+        # Fail: pure greeting in response to a question
+        question_words = {
+            'what', 'which', 'how', 'who', 'where', 'when',
+            'do', 'did', 'can', 'tell', 'describe', 'have', 'are'
+        }
+        input_words  = set(user_input.lower().split())
+        is_question  = bool(input_words & question_words)
+        lazy_replies = {
+            'namaste!', 'namaste', 'hi! i am happy to talk to you.',
+            'hello! i am little deepak.', 'bye bye!',
+            'goodbye! i will study hard.', 'see you! i love learning.',
+        }
+        if is_question and response.strip().lower() in lazy_replies:
+            correction = self._request_correction(user_input, response)
+            self._record_fail(user_input, response, correction)
+            return False, correction
+
+    def _evaluate_and_correct(
+        self, user_input: str, response: str
+    ) -> tuple:
+        """
+        Instead of asking the model to evaluate (unreliable format parsing),
+        ask it to generate what Deepak SHOULD say, then compare.
+        If actual response is close enough → good.
+        If not → use model's version as the correction.
+        """
+        # Ask model: what should Deepak say here?
+        prompt = (
+            f"Little Deepak is a good 5-year-old Indian child.\n"
+            f"Someone said to him: \"{user_input}\"\n\n"
+            f"Write exactly what Deepak should say in reply. "
+            f"One or two simple sentences. Start with 'i' or 'yes' or 'namaste'. "
+            f"Write only his reply, nothing else."
+        )
         try:
             resp = self.client.chat.completions.create(
                 model=MODEL,
@@ -324,25 +348,37 @@ class AutoDriver:
                     {'role': 'user',   'content': prompt},
                 ],
             )
-            raw = (resp.choices[0].message.content or '').strip().lower()
+            expected = (resp.choices[0].message.content or '').strip().lower()
+            expected = expected.split('\n')[0].strip().strip('"\'')
 
-            if raw.startswith('good'):
+            if not expected or len(expected) < 3:
                 return True, None
 
-            elif raw.startswith('bad:'):
-                correction = raw[4:].strip().strip('"\'')
-                if correction and len(correction) > 3:
-                    self._apply_correction(response, correction)
-                    self._recent_fails.append(user_input)
-                    if len(self._recent_fails) > RECENT_FAILS_SIZE:
-                        self._recent_fails.pop(0)
-                    self._corrections += 1
-                    return False, correction
+            # Compare actual response with expected
+            from difflib import SequenceMatcher
+            similarity = SequenceMatcher(
+                None, response.lower(), expected.lower()
+            ).ratio()
+
+            if similarity >= 0.6:
+                # Close enough — Deepak got it right
+                return True, None
+            else:
+                # Too different — use model's version as correction
+                self._record_fail(user_input, response, expected)
+                return False, expected
 
         except Exception:
-            pass
+            return True, None
 
-        return True, None   # on failure, assume OK
+    def _record_fail(self, user_input: str, response: str,
+                     correction: str) -> None:
+        """Record failure and apply correction."""
+        self._apply_correction(response, correction)
+        self._recent_fails.append(user_input)
+        if len(self._recent_fails) > RECENT_FAILS_SIZE:
+            self._recent_fails.pop(0)
+        self._corrections += 1
 
     def _apply_correction(self, bad: str, good: str) -> None:
         """
