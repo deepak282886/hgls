@@ -252,38 +252,30 @@ class AutoDriver:
         if self._recent_fails and random.random() < 0.7:
             failed_input = random.choice(self._recent_fails[-10:])
             prompt = (
-                f"You are talking to Little Deepak, a good 5-year-old Indian child.\n"
-                f"He recently struggled with: '{failed_input}'\n\n"
-                f"Ask him about the same topic in a different, simpler way. "
-                f"One short friendly sentence. No explanation."
+                f"Ask a 5-year-old child about this topic in a simpler way: "
+                f"\"{failed_input}\"\nWrite one short friendly question:"
             )
         else:
-            # Pick next topic seed
             topic = TOPIC_SEEDS[self._topic_idx % len(TOPIC_SEEDS)]
             self._topic_idx += 1
             prompt = (
-                f"You are talking to Little Deepak, a good 5-year-old Indian child.\n"
-                f"Your task: {topic}\n\n"
-                f"Write one short, friendly sentence to say to him. "
-                f"Simple language. No explanation."
+                f"Task: {topic}\n"
+                f"Write one short friendly sentence to say to a 5-year-old Indian child:"
             )
 
         try:
             resp = self.client.chat.completions.create(
                 model=MODEL,
-                max_tokens=80,
+                max_tokens=512,
                 messages=[
-                    {'role': 'system', 'content': persona.PARENT_SYSTEM_PROMPT},
-                    {'role': 'user',   'content': prompt},
+                    {'role': 'user', 'content': prompt},
                 ],
             )
             raw = resp.choices[0].message.content or ''
-            # Clean up — take first sentence only, strip quotes
             raw = raw.strip().strip('"\'').split('\n')[0].strip()
             return raw.lower()
         except Exception as e:
             print(f'  [Auto] Input generation failed: {e}')
-            # Fall back to a direct topic seed as plain text
             seed = TOPIC_SEEDS[self._topic_idx % len(TOPIC_SEEDS)]
             self._topic_idx += 1
             return seed
@@ -326,26 +318,19 @@ class AutoDriver:
         self, user_input: str, response: str
     ) -> tuple:
         """
-        Instead of asking the model to evaluate (unreliable format parsing),
-        ask it to generate what Deepak SHOULD say, then compare.
-        If actual response is close enough → good.
-        If not → use model's version as the correction.
+        Ask model what Deepak should say, compare with what he said.
+        Short prompt + high max_tokens — model was running out of output space.
         """
-        # Ask model: what should Deepak say here?
         prompt = (
-            f"Little Deepak is a good 5-year-old Indian child.\n"
-            f"Someone said to him: \"{user_input}\"\n\n"
-            f"Write exactly what Deepak should say in reply. "
-            f"One or two simple sentences. Start with 'i' or 'yes' or 'namaste'. "
-            f"Write only his reply, nothing else."
+            f"A 5-year-old Indian child is asked: \"{user_input}\"\n"
+            f"Reply as the child in one sentence:"
         )
         try:
             resp = self.client.chat.completions.create(
                 model=MODEL,
-                max_tokens=80,
+                max_tokens=512,
                 messages=[
-                    {'role': 'system', 'content': persona.PARENT_SYSTEM_PROMPT},
-                    {'role': 'user',   'content': prompt},
+                    {'role': 'user', 'content': prompt},
                 ],
             )
             expected = (resp.choices[0].message.content or '').strip().lower()
@@ -354,17 +339,14 @@ class AutoDriver:
             if not expected or len(expected) < 3:
                 return True, None
 
-            # Compare actual response with expected
             from difflib import SequenceMatcher
             similarity = SequenceMatcher(
                 None, response.lower(), expected.lower()
             ).ratio()
 
             if similarity >= 0.6:
-                # Close enough — Deepak got it right
                 return True, None
             else:
-                # Too different — use model's version as correction
                 self._record_fail(user_input, response, expected)
                 return False, expected
 
