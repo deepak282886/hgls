@@ -2,13 +2,7 @@
 
 ### Current Probe - 
 
-'i brush'  →  'i brush my teeth'
-'when i sleep'  →  'when i sleep early i wake up happy'
-'i love amma'  →  'i love amma then early'
-'when i tell the truth'  →  'when i tell the truth i feel proud'
-'i share'  →  'i share my food'
-'when i help'  →  'when i help amma she smiles'
-'i go to school'  →  'i go to school so i wash my hands and i help my friend'
+![alt text](image-1.png)
 
 ### Version 0.4 — Little Deepak Edition
 
