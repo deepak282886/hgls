@@ -142,10 +142,11 @@ class AutoDriver:
                 # 2. Get Deepak's response — generative unit generates directly
                 response = self.system.respond(user_input)
 
-                # Filter model reasoning leaks — discard and retry
+                # Only filter Deepak's response for leaks — not the parent input
                 if self._is_leaked(response):
-                    print(f'\n  [{self._turn:4d}] [leak filtered — retrying]')
-                    continue
+                    print(f'\n  [{self._turn:4d}] [response leaked — skipping]')
+                    self._current_input = None  # move on, don't retry forever
+                    return
 
                 # 3. Evaluate
                 good, corrected = self._evaluate_and_correct(user_input, response)

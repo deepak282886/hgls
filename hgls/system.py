@@ -245,6 +245,7 @@ class HGLSystem:
           3. LLM parent corrects if wrong — correction learned immediately
         """
         text = self.sensory_motor.receive_input(user_input)
+        self.memory.clear()   # fresh start for each new question
         self.memory.push(text)
         context = self.memory.get_context()
 
