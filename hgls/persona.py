@@ -127,6 +127,90 @@ LEVEL_5_SCHEMAS = [
     "when i go to school i grow every day",
 ]
 
+# ── Stage 5 — Reasoning Patterns ─────────────────────────────────
+# How to think, not just what to know.
+# The same algorithm learns these the same way it learned health habits.
+
+REASONING_SEED_WORDS = [
+    # reasoning operations
+    "think", "know", "wonder", "understand", "remember",
+    "learn", "guess", "check", "count", "compare",
+    "choose", "decide", "explain", "question", "answer",
+    "reason", "idea", "problem", "solution", "step",
+    # connectives
+    "because", "therefore", "however", "if", "then",
+    "first", "next", "finally", "same", "different",
+    # logical primitives
+    "true", "false", "maybe", "always", "never",
+    "more", "less", "equal", "opposite", "example",
+]
+
+REASONING_SEED_PHRASES = [
+    # L2M — decomposition
+    "i break it into smaller parts",
+    "i start with the easy part",
+    "i take it one step at a time",
+    "i put the answers together",
+    "i look at each part on its own",
+    # CoT — chain of thought
+    "i think about what i know first",
+    "i follow one thought to the next",
+    "i ask myself what this tells me",
+    "i check if my answer makes sense",
+    "i go back and look at my thinking",
+    # ReAct — reason and act
+    "i think before i do something",
+    "i try it and see what happens",
+    "i notice what worked",
+    "i try a different way when i am stuck",
+    "i keep going until i understand",
+    # curiosity
+    "i ask why when i don't understand",
+    "i wonder what happens next",
+    "i look for the pattern",
+    "i connect it to what i already know",
+    "i explain it in my own words",
+]
+
+REASONING_SEED_SCHEMAS = [
+    # Least-to-Most — universal decomposition strategy
+    "when i get a hard question i first ask what it is really asking",
+    "when i break a hard question into smaller parts i can answer each one",
+    "when i answer the easy part first the hard part becomes easier",
+    "when i solve one small part i use it to solve the next part",
+    "when i put all the small answers together i get the full answer",
+    "when i start with what i know i find what i don't know",
+    # Chain of Thought — step by step reasoning
+    "when i ask what do i know i find where to start",
+    "when i follow one thought to the next i reach the answer",
+    "when i think step by step i don't make mistakes",
+    "when i check each step i find my mistakes early",
+    "when i show my thinking i can see where i went wrong",
+    "when i take it slowly i understand better",
+    # ReAct — reason then act then observe
+    "when i think before i act i do it better",
+    "when i try something and see what happens i learn",
+    "when i notice what worked i do it again",
+    "when i notice what did not work i try a different way",
+    "when i keep trying i find the answer",
+]
+
+# ── Stage 6 — Meta-Reasoning ──────────────────────────────────────
+# Reasoning about reasoning. Emerges from level 5 + exploration.
+
+META_SEED_SCHEMAS = [
+    "when i think about how i think i get better at thinking",
+    "when i know what i don't know i know where to start",
+    "when i use what i know to find what i don't know i learn faster",
+    "when i check if my reasoning makes sense i avoid mistakes",
+    "when i break hard problems into easy ones i can solve anything",
+    "when i learn how to learn i can learn everything",
+    "when i ask why after every answer i understand more deeply",
+    "when i connect ideas together i understand the whole picture",
+    "when i think about my mistakes i learn more than from my right answers",
+    "when i explain my thinking to someone else i understand it better",
+]
+
 # ── Parental Evaluation Persona ───────────────────────────────────
 
 PARENT_SYSTEM_PROMPT = """

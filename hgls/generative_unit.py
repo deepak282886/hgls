@@ -285,6 +285,106 @@ class HierarchicalGenerativeUnit:
                 )
                 self.library.add_success(abstracted)
 
+    # ── Generation ────────────────────────────────────────────────
+
+    def generate(self, input_text: str, context: list = None) -> str:
+        """
+        Generate a response using Chain of Thought grounded in the library.
+
+        Step 1: Do I know anything about this?
+                Search library for topic overlap.
+                If best match is weak → "i am not sure" (honest uncertainty)
+
+        Step 2: What do I know?
+                Find the most relevant structures.
+
+        Step 3: What does that tell me / what is my answer?
+                Compose from what is known, non-redundantly.
+
+        Uncertainty is a signal to the parent to teach, not a failure.
+        """
+        topics = self._extract_topics(input_text)
+
+        # Enrich topics from working memory context
+        if context:
+            for ctx in context[-3:]:
+                topics |= self._extract_topics(str(ctx))
+
+        if not topics:
+            return 'i am not sure'
+
+        # Build known vocabulary from word-level library
+        known_vocab: set = set()
+        for struct in self.library.get_at_level(2, kind='success'):
+            known_vocab.update(struct.generate(self.library).lower().split())
+        known_vocab.update({'a', 'i', 'is', 'at', 'do', 'go', 'my',
+                            'me', 'we', 'he', 'be', 'no', 'so', 'to',
+                            'up', 'as', 'an', 'or', 'in', 'on', 'if'})
+
+        # Score every library structure by relevant content density
+        scored = []
+        for level in range(7):
+            for struct in self.library.get_at_level(level, kind='success'):
+                text = struct.generate(self.library)
+                if not text or len(text.split()) < 2:
+                    continue
+                words = text.lower().split()
+                if any(
+                    (not w[0].isalpha() if w else True) or
+                    (len(w) <= 2 and w not in known_vocab)
+                    for w in words
+                ):
+                    continue
+                text_words = set(words)
+                overlap    = len(topics & text_words)
+                if overlap > 0:
+                    info = overlap * len(text_words) * max(struct.fitness, 0.1)
+                    scored.append((info, overlap, text))
+
+        # ── Step 1: Do I know anything about this? ────────────────
+        if not scored:
+            return 'i am not sure about that'
+
+        # Best overlap score the library can produce for this question
+        best_overlap = max(s[1] for s in scored)
+
+        # If even the best match shares only 1 word with the question,
+        # Deepak genuinely doesn't have relevant knowledge — say so
+        if best_overlap <= 1:
+            return 'i am not sure. i don\'t know about that yet'
+
+        # ── Step 2-3: Compose from what is known ──────────────────
+        scored.sort(reverse=True)
+
+        parts      = []
+        seen_words: set = set()
+        for _, _, text in scored:
+            text_words = set(text.split())
+            new_words  = text_words - seen_words
+            if len(new_words) >= 4:
+                parts.append(text)
+                seen_words |= text_words
+            if len(parts) >= 2:
+                break
+
+        return '. '.join(parts) if parts else 'i am not sure'
+
+    @staticmethod
+    def _extract_topics(text: str) -> set:
+        """Extract meaningful content words — the signal, not the noise."""
+        _STOP = {
+            'do', 'you', 'your', 'what', 'how', 'are', 'is', 'can', 'does',
+            'the', 'a', 'an', 'in', 'on', 'at', 'to', 'and', 'or', 'but',
+            'that', 'this', 'it', 'he', 'she', 'they', 'we', 'me', 'my',
+            'yes', 'no', 'not', 'so', 'tell', 'about', 'did', 'will',
+            'have', 'has', 'was', 'were', 'be', 'been', 'am',
+            'little', 'deepak', 'hey', 'hi', 'hello', 'dear',
+            'when', 'where', 'who', 'why', 'which', 'today', 'now',
+            'just', 'even', 'very', 'much', 'many', 'more', 'some',
+        }
+        words = set(text.lower().strip().rstrip('?!.').split())
+        return {w for w in words if w not in _STOP and len(w) > 2}
+
     # ── Stats ─────────────────────────────────────────────────────
 
     def stats(self) -> dict:

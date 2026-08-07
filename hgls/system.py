@@ -22,7 +22,6 @@ from hgls.curriculum      import CurriculumController, Stage
 from hgls.sensory_motor   import SensoryMotorInterface
 from hgls.generative_unit import HierarchicalGenerativeUnit
 from hgls.explorer        import ExplorationEngine
-from hgls.composer        import ResponseComposer
 
 
 class HGLSystem:
@@ -40,7 +39,6 @@ class HGLSystem:
       SelfModel                   — agency / self vs. external distinction
       CurriculumController        — developmental stage management
       ExplorationEngine           — internal dot-connecting between structures
-      ResponseComposer            — compositional dialogue response generator
       LLMParentalInterface        — external evaluative signal (optional, fades)
     """
 
@@ -65,7 +63,8 @@ class HGLSystem:
 
         self.tester = ExtremeTester(llm_parent=self.llm_parent)
 
-        # One generative unit per level (0–4)
+        # One generative unit per level (0–6)
+        # Same algorithm at every level — only the content differs
         self.units: Dict[int, HierarchicalGenerativeUnit] = {
             lvl: HierarchicalGenerativeUnit(
                 level=lvl,
@@ -75,7 +74,7 @@ class HGLSystem:
                 curriculum=self.curriculum,
                 llm_parent=self.llm_parent,
             )
-            for lvl in range(5)
+            for lvl in range(7)
         }
 
         # Exploration engine — internal dot-connecting
@@ -86,12 +85,7 @@ class HGLSystem:
             curriculum=self.curriculum,
             llm_parent=self.llm_parent,
         )
-
-        # Response composer — compositional dialogue generation
-        self.composer = ResponseComposer(
-            library=self.library,
-            curriculum=self.curriculum,
-        )
+        self.explorer.set_units(self.units)
 
         self._cycle_count = 0
         self._bootstrap()
@@ -242,21 +236,30 @@ class HGLSystem:
 
     def respond(self, user_input: str) -> str:
         """
-        Generate a response, then have the LLM parent evaluate it.
-        If the response is wrong, the parent corrects it:
-          - bad response → marked as failure in library
-          - corrected version → learned as new structure
-        Every conversation is a learning opportunity.
-        """
-        text     = self.sensory_motor.receive_input(user_input)
-        response = self.composer.compose(text)
+        Generate a response using the generative unit directly.
+        Same unit that learns also generates — no separate modules.
 
-        # LLM parent evaluates and corrects if needed
-        if self.llm_parent and self.llm_parent._active():
+        Flow:
+          1. Generative unit at active level generates from library
+          2. Falls back to lower levels if active level has no relevant content
+          3. LLM parent corrects if wrong — correction learned immediately
+        """
+        text = self.sensory_motor.receive_input(user_input)
+        self.memory.push(text)
+        context = self.memory.get_context()
+
+        # Try active level first, fall back through levels
+        level    = self.curriculum.get_active_level()
+        response = ''
+        for lvl in range(level, -1, -1):
+            response = self.units[lvl].generate(text, context=context)
+            if response:
+                break
+
+        # LLM correction
+        if response and self.llm_parent and self.llm_parent._active():
             response = self._parent_correct(text, response)
 
-        # Learn from what was said to us
-        self.run_cycle(text)
         return response
 
     def _parent_correct(self, user_input: str, response: str) -> str:
@@ -376,9 +379,8 @@ class HGLSystem:
         self.curriculum.current_stage = Stage(stage)
 
         # Rewire all modules that hold a library reference
-        self.tester.llm_parent      = self.llm_parent
-        self.explorer.library       = self.library
-        self.composer.library       = self.library
+        self.tester.llm_parent = self.llm_parent
+        self.explorer.library  = self.library
         for unit in self.units.values():
             unit.library = self.library
 

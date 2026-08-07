@@ -37,61 +37,6 @@ MAX_RETRIES       = 5      # retries per turn before giving up
 RECENT_FAILS_SIZE = 20     # how many recent failures to track for targeting
 
 
-# ── Topic seeds ───────────────────────────────────────────────────
-# The driver cycles through these to keep conversation broad.
-# Weighted toward things Deepak is still weak on.
-
-TOPIC_SEEDS = [
-    # identity
-    "greet Little Deepak",
-    "ask Little Deepak his name",
-    "ask how he is feeling today",
-    # health
-    "ask if he brushes his teeth",
-    "ask what he eats for breakfast",
-    "ask when he sleeps",
-    "ask if he drinks water",
-    "ask about his morning routine",
-    # family
-    "ask about his amma",
-    "ask about his appa",
-    "ask about his didi",
-    "ask about his bhaiya",
-    "ask who he loves",
-    "ask who he helps at home",
-    # respect
-    "ask how he greets elders",
-    "ask if he says namaste",
-    "ask what he does when he makes a mistake",
-    # feelings
-    "ask if he is happy",
-    "ask what makes him happy",
-    "ask what makes him sad",
-    "ask if he ever feels proud",
-    # learning
-    "ask about school",
-    "ask what he learns",
-    "ask about his favourite book",
-    "ask if he likes to read",
-    "ask about his teacher",
-    # values
-    "ask if he shares his food",
-    "ask if he tells the truth",
-    "ask if he helps his friends",
-    "ask what he does when a friend is sad",
-    # world knowledge
-    "ask about colors he can see",
-    "ask what he sees outside",
-    "ask about animals he knows",
-    "ask about the weather",
-    "ask about numbers he knows",
-    # open
-    "ask Little Deepak to tell you something he learned today",
-    "ask Little Deepak what a good child does",
-    "ask Little Deepak to say something kind",
-]
-
-
 class AutoDriver:
     """
     Autonomous conversation driver.
@@ -110,7 +55,6 @@ class AutoDriver:
         self._turn          = 0
         self._corrections   = 0
         self._recent_fails  = []   # recent inputs that produced bad responses
-        self._topic_idx     = 0
         self._session_log   = []
         self._current_input = None  # held until Deepak answers correctly
         self._attempt_count = 0
@@ -195,10 +139,13 @@ class AutoDriver:
 
                 self._attempt_count += 1
 
-                # 2. Get Deepak's response
-                response = self.system.composer.compose(
-                    self.system.sensory_motor.receive_input(user_input)
-                )
+                # 2. Get Deepak's response — generative unit generates directly
+                response = self.system.respond(user_input)
+
+                # Filter model reasoning leaks — discard and retry
+                if self._is_leaked(response):
+                    print(f'\n  [{self._turn:4d}] [leak filtered — retrying]')
+                    continue
 
                 # 3. Evaluate
                 good, corrected = self._evaluate_and_correct(user_input, response)
@@ -218,7 +165,10 @@ class AutoDriver:
 
                 # 5. Do NOT learn from the parent's input — that teaches
                 # Deepak to echo questions back. Only learn from corrections.
-                if good:
+                if good or self._attempt_count >= 10:
+                    # Move on — either Deepak nailed it or enough attempts made
+                    if not good and self._attempt_count >= 10:
+                        print(f'  [Auto] Moving on after {self._attempt_count} attempts.')
                     self._current_input = None
                 # else: stay on same input, correction already learned
 
@@ -245,40 +195,60 @@ class AutoDriver:
 
     def _generate_input(self) -> Optional[str]:
         """
-        Generate the next thing to say to Deepak.
-        Biased toward topics where Deepak recently failed.
+        Generate questions that require reasoning, not just recall.
+        Biased toward why/how/what happens questions that force
+        Deepak to think step by step rather than just retrieve a fact.
         """
-        # 70% of the time: target a recent failure if we have one
+        # 70%: target a recent failure to close gaps
         if self._recent_fails and random.random() < 0.7:
-            failed_input = random.choice(self._recent_fails[-10:])
+            failed = random.choice(self._recent_fails[-10:])
             prompt = (
-                f"Ask a 5-year-old child about this topic in a simpler way: "
-                f"\"{failed_input}\"\nWrite one short friendly question:"
+                f"A 5-year-old Indian child struggled with: \"{failed}\"\n"
+                f"Ask a simpler reasoning question about the same topic.\n"
+                f"Use why, how, or what happens — not just what.\n"
+                f"Write one short question:"
             )
         else:
-            topic = TOPIC_SEEDS[self._topic_idx % len(TOPIC_SEEDS)]
-            self._topic_idx += 1
-            prompt = (
-                f"Task: {topic}\n"
-                f"Write one short friendly sentence to say to a 5-year-old Indian child:"
-            )
+            # Pick a random library structure as seed
+            level   = min(self.system.curriculum.get_active_level(), 4)
+            structs = self.system.library.get_at_level(level, kind='success')
+            if structs:
+                seed      = random.choice(structs[:100])
+                seed_text = seed.generate(self.system.library).strip()
+                prompt    = (
+                    f"Deepak knows: \"{seed_text}\"\n"
+                    f"Ask a question that makes him think about why or how "
+                    f"or what happens — not just what it is.\n"
+                    f"Write one short question for a 5-year-old:"
+                )
+            else:
+                prompt = (
+                    f"Write one reasoning question for a 5-year-old Indian child.\n"
+                    f"Use why, how, or what happens.\n"
+                    f"Write one short question:"
+                )
 
         try:
             resp = self.client.chat.completions.create(
                 model=MODEL,
                 max_tokens=512,
-                messages=[
-                    {'role': 'user', 'content': prompt},
-                ],
+                messages=[{'role': 'user', 'content': prompt}],
             )
-            raw = resp.choices[0].message.content or ''
-            raw = raw.strip().strip('"\'').split('\n')[0].strip()
-            return raw.lower()
+            raw = (resp.choices[0].message.content or '').strip()
+            raw = raw.split('\n')[0].strip().strip('"\'')
+            raw = self._clean_input(raw)
+            if raw and all(ord(c) < 128 for c in raw) and len(raw) > 5:
+                return raw
         except Exception as e:
             print(f'  [Auto] Input generation failed: {e}')
-            seed = TOPIC_SEEDS[self._topic_idx % len(TOPIC_SEEDS)]
-            self._topic_idx += 1
-            return seed
+
+        # Fallback
+        level   = min(self.system.curriculum.get_active_level(), 3)
+        structs = self.system.library.get_at_level(level, kind='success')
+        if structs:
+            seed = random.choice(structs[:20])
+            return f"why do you {seed.generate(self.system.library).strip()}"
+        return None
 
     # ── Evaluation and correction ─────────────────────────────────
 
@@ -318,40 +288,97 @@ class AutoDriver:
         self, user_input: str, response: str
     ) -> tuple:
         """
-        Ask model what Deepak should say, compare with what he said.
-        Short prompt + high max_tokens — model was running out of output space.
+        Evaluate and correct using Chain of Thought demonstration.
+
+        Evaluation checks:
+          1. Is the response on topic?
+          2. Is it age-appropriate?
+          3. Does it show any thinking (not just a retrieved fact)?
+
+        When correcting, the parent demonstrates Chain of Thought:
+          - what do i know about this
+          - what does that tell me
+          - so my answer is
+
+        Deepak learns the thinking pattern from the demonstrated correction,
+        not just the final answer.
         """
         prompt = (
-            f"A 5-year-old Indian child is asked: \"{user_input}\"\n"
-            f"Reply as the child in one sentence:"
+            f"A 5-year-old Indian child was asked: \"{user_input}\"\n"
+            f"The child said: \"{response}\"\n\n"
+            f"Evaluate:\n"
+            f"1. Is it on topic?\n"
+            f"2. Is it age-appropriate?\n"
+            f"3. Does it make sense as an answer?\n\n"
+            f"If all three yes, write only: YES\n\n"
+            f"If any is no, write: NO\n"
+            f"Then show how the child should think through it step by step "
+            f"using this pattern:\n"
+            f"i know [what i know]. [what that means]. so [my answer].\n"
+            f"Keep it simple, one sentence per step, in the child's voice."
         )
         try:
             resp = self.client.chat.completions.create(
                 model=MODEL,
                 max_tokens=512,
-                messages=[
-                    {'role': 'user', 'content': prompt},
-                ],
+                messages=[{'role': 'user', 'content': prompt}],
             )
-            expected = (resp.choices[0].message.content or '').strip().lower()
-            expected = expected.split('\n')[0].strip().strip('"\'')
+            raw   = (resp.choices[0].message.content or '').strip()
+            lines = [l.strip() for l in raw.split('\n') if l.strip()]
 
-            if not expected or len(expected) < 3:
+            if not lines:
                 return True, None
 
-            from difflib import SequenceMatcher
-            similarity = SequenceMatcher(
-                None, response.lower(), expected.lower()
-            ).ratio()
+            verdict = lines[0].upper()
 
-            if similarity >= 0.6:
+            if 'YES' in verdict:
                 return True, None
-            else:
-                self._record_fail(user_input, response, expected)
-                return False, expected
+
+            if 'NO' in verdict:
+                # Collect the demonstrated chain of thought
+                correction = ' '.join(lines[1:]).strip().strip('"\'')
+                if self._is_leaked(correction) or not correction or len(correction) < 3:
+                    return True, None
+                self._record_fail(user_input, response, correction)
+                return False, correction
 
         except Exception:
-            return True, None
+            pass
+
+        return True, None
+
+    # ── Leak detection ────────────────────────────────────────────
+
+    @staticmethod
+    def _is_leaked(text: str) -> bool:
+        """
+        Detect when the model returns its own reasoning instead of
+        Deepak's response. These strings signal a prompt leak.
+        """
+        if not text:
+            return False
+        text_lower = text.lower()
+        leak_markers = [
+            'as a 5-year-old', 'as the child', 'one sentence',
+            'first person', 'keep it simple', 'respond as',
+            'analysis', 'maybe simple', 'something like',
+            'write as a child', 'should be one sentence',
+            'i think a common', 'in english', 'indian child maybe',
+            'let me think', 'the model', 'llm', 'prompt',
+            'step-by-step for the child', 'stepbystep',
+            'step by step for', 'child\'s voice', 'childs voice',
+            'thinking childs', 'in the child', 'for the child',
+        ]
+        return any(m in text_lower for m in leak_markers)
+
+    @staticmethod
+    def _clean_input(text: str) -> str:
+        """Strip markdown formatting from parent questions."""
+        import re
+        text = re.sub(r'\*+', '', text)   # remove ** bold markers
+        text = re.sub(r'_+', '', text)    # remove _ italic markers
+        text = re.sub(r'\s+', ' ', text)  # normalise whitespace
+        return text.strip().lower()
 
     def _record_fail(self, user_input: str, response: str,
                      correction: str) -> None:
@@ -365,8 +392,11 @@ class AutoDriver:
     def _apply_correction(self, bad: str, good: str) -> None:
         """
         Penalise the bad response and learn the corrected one.
-        Also stores as a QA pair so the composer finds it next time.
+        Filters leaked model reasoning before anything enters the library.
         """
+        # Don't store leaked model reasoning in the library
+        if self._is_leaked(good) or self._is_leaked(bad):
+            return
         from hgls.structures import GenerativeStructure
         level = self.system.curriculum.get_active_level()
 
@@ -379,14 +409,9 @@ class AutoDriver:
         )
         self.system.library.add_failure(bad_struct)
 
-        # Learn the corrected version into the library
+        # Learn the corrected version — enters library through normal pipeline
+        # Next time generate() searches the library, it finds the correction
         self.system.run_cycle(good)
-
-        # Store as QA pair in the composer so it's found directly next time
-        if hasattr(self.system, 'composer') and self._current_input:
-            self.system.composer.add_learned_answer(
-                self._current_input, good
-            )
 
     # ── Logging ───────────────────────────────────────────────────
 

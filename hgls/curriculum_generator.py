@@ -29,21 +29,76 @@ COUNTS = {2: 25, 3: 20, 4: 12}
 # Each domain unlocks after the previous saturates.
 # Ordered from closest to Deepak's immediate world outward.
 DOMAINS = [
-    "body parts",               # head hands legs eyes nose ears mouth
-    "colors and shapes",        # red blue green round big small
-    "numbers and counting",     # one two three count first second
-    "nature and weather",       # sun moon rain tree flower bird sky cloud
-    "food and meals",           # rice roti dal milk fruit breakfast lunch
-    "home and daily life",      # kitchen bedroom morning bedtime routine
-    "feelings and emotions",    # happy sad angry scared excited proud
-    "animals",                  # dog cat cow bird elephant fish
-    "festivals and celebrations",  # diwali holi birthday new year
-    "school and learning",      # pencil book draw write blackboard
-    "community and helpers",    # doctor teacher policeman shopkeeper
-    "simple world facts",       # sky is blue fire is hot water is wet
-    "moral reasoning",          # right wrong fair unfair kind unkind
-    "questions and curiosity",  # what where why how wonder explore
-    "stories and imagination",  # once upon a time hero adventure dream
+    # ── Foundation (5-year-old world) ────────────────────────────
+    "body parts",
+    "colors and shapes",
+    "numbers and counting",
+    "nature and weather",
+    "food and meals",
+    "home and daily life",
+    "feelings and emotions",
+    "animals",
+    "festivals and celebrations",
+    "school and learning",
+    "community and helpers",
+    "simple world facts",
+    "moral reasoning",
+    "questions and curiosity",
+    "stories and imagination",
+
+    # ── Reasoning and thinking ────────────────────────────────────
+    "logical reasoning and thinking",
+    "problem solving strategies",
+    "comparing and classifying",
+    "patterns and rules",
+    "cause and effect in everyday life",
+
+    # ── Mathematics ───────────────────────────────────────────────
+    "addition and subtraction",
+    "multiplication and division basics",
+    "shapes and geometry",
+    "measurement and units",
+    "time and calendar",
+    "fractions and parts",
+    "patterns and sequences in numbers",
+
+    # ── Language and communication ────────────────────────────────
+    "reading and comprehension",
+    "grammar and sentence structure",
+    "vocabulary and word meanings",
+    "writing and expression",
+    "poetry and rhythm",
+
+    # ── Science ───────────────────────────────────────────────────
+    "plants and living things",
+    "animals and their habitats",
+    "human body and health",
+    "earth and environment",
+    "weather and seasons",
+    "simple physics and forces",
+    "light and sound",
+    "materials and their properties",
+
+    # ── Social and world knowledge ────────────────────────────────
+    "history and how things were",
+    "geography and places in the world",
+    "different cultures and traditions",
+    "community and society",
+    "rights and responsibilities",
+
+    # ── Advanced reasoning ────────────────────────────────────────
+    "critical thinking and analysis",
+    "hypothesis and evidence",
+    "decision making and choices",
+    "ethics and values in depth",
+    "philosophy and big questions",
+
+    # ── Skills and creativity ─────────────────────────────────────
+    "arts and music",
+    "physical education and sports",
+    "technology and how things work",
+    "creativity and imagination",
+    "memory and learning skills",
 ]
 
 
