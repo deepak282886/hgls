@@ -2,13 +2,16 @@
 system.py — HGLSystem.
 
 Integrates all modules and runs the developmental learning loop.
-Starts from keyboard character primitives and grows upward through
-curriculum-controlled stages toward 5-year-old-level text competence.
+
+Changes in this version:
+  - _parent_correct() uses learn_correction() so teacher content is tagged
+    and carries higher effective fitness for matching topics
+  - ingest_text() — pre-training entry point for dataset ingestion
+  - Removed all composer references
 """
 
 import os
 import json
-from difflib import SequenceMatcher
 from typing import List, Optional, Dict, Any
 
 from hgls.structures      import GenerativeStructure
@@ -26,24 +29,23 @@ from hgls.explorer        import ExplorationEngine
 
 class HGLSystem:
     """
-    Hierarchical Generative Learning System v0.4
+    Hierarchical Generative Learning System
 
     Module inventory:
       SensoryMotorInterface       — keyboard-level I/O
-      HierarchicalGenerativeUnits (×5) — uniform learning algorithm per level
+      HierarchicalGenerativeUnits (×7) — uniform algorithm per level 0-6
       Library                     — long-term memory (extreme outcomes only)
       WorkingMemory               — short-term context buffer
-      ExtremeTester               — success / failure / mediocre classification
-      InternalRewardSystem        — novelty + competence + curiosity signals
+      ExtremeTester               — gradient scoring + autoregressive token test
+      InternalRewardSystem        — novelty + competence + curiosity + propagation
       AttentionMechanism          — salience-weighted resource allocation
       SelfModel                   — agency / self vs. external distinction
       CurriculumController        — developmental stage management
-      ExplorationEngine           — internal dot-connecting between structures
+      ExplorationEngine           — internal composition between structures
       LLMParentalInterface        — external evaluative signal (optional, fades)
     """
 
     def __init__(self, use_llm: bool = True):
-        # Core modules
         self.library       = Library()
         self.curriculum    = CurriculumController()
         self.reward        = InternalRewardSystem()
@@ -52,7 +54,6 @@ class HGLSystem:
         self.self_model    = SelfModel()
         self.sensory_motor = SensoryMotorInterface()
 
-        # Optional LLM parent
         self.llm_parent = None
         if use_llm:
             try:
@@ -63,8 +64,6 @@ class HGLSystem:
 
         self.tester = ExtremeTester(llm_parent=self.llm_parent)
 
-        # One generative unit per level (0–6)
-        # Same algorithm at every level — only the content differs
         self.units: Dict[int, HierarchicalGenerativeUnit] = {
             lvl: HierarchicalGenerativeUnit(
                 level=lvl,
@@ -77,7 +76,6 @@ class HGLSystem:
             for lvl in range(7)
         }
 
-        # Exploration engine — internal dot-connecting
         self.explorer = ExplorationEngine(
             library=self.library,
             tester=self.tester,
@@ -93,50 +91,38 @@ class HGLSystem:
     # ── Bootstrap ─────────────────────────────────────────────────
 
     def _bootstrap(self) -> None:
-        """Seed the library with atomic character-level primitives."""
         primitives = self.curriculum.bootstrap_char_structures()
         for s in primitives:
             self.self_model.mark_external(s)
             self.library.add_success(s)
-        print(
-            f"[Bootstrap] Seeded library with {len(primitives)} "
-            f"character primitives."
-        )
+        print(f"[Bootstrap] Seeded library with {len(primitives)} character primitives.")
 
-    # ── Main loop ─────────────────────────────────────────────────
+    # ── Main learning cycle ────────────────────────────────────────
 
     def run_cycle(self, raw_input: str, target_level: int = None) -> Dict[str, Any]:
         """
         Process one input through the full learning cycle.
-        target_level overrides the curriculum stage — used during domain expansion
-        to learn words at level 2, phrases at level 3, schemas at level 4.
-        Returns a summary dict.
+        target_level overrides the curriculum stage (used during domain expansion).
         """
         self._cycle_count += 1
 
-        # 1. Receive and normalise input
         text = self.sensory_motor.receive_input(raw_input)
         if not text:
             return {'cycle': self._cycle_count, 'error': 'empty input'}
 
-        # 2. Store in working memory
         self.memory.push(text)
 
-        # 3. Compute salience → hypothesis budget
         level    = target_level if target_level is not None else self.curriculum.get_active_level()
         salience = self.attention.compute_salience(text, level)
         n_hyp    = self.attention.allocate_hypotheses(14, salience)
 
-        # 4. Learn
         unit          = self.units[level]
         cycle_results = unit.learn(text, n_hypotheses=n_hyp)
 
-        # 5. Mark self-generated structures
         for struct, outcome, score in cycle_results:
             if outcome == 'success':
                 self.self_model.mark_self_generated(struct)
 
-        # 6. Curriculum tick + advancement (only when following curriculum naturally)
         advanced = False
         if target_level is None:
             self.curriculum.tick()
@@ -145,7 +131,6 @@ class HGLSystem:
                 advanced  = True
                 print(f"\n[Curriculum] *** Advanced to: {new_stage.name} ***\n")
 
-        # 7. Accelerate LLM decay once the system matures
         if self.llm_parent and self.reward.maturity > 0.5:
             self.llm_parent._decay()
 
@@ -169,7 +154,6 @@ class HGLSystem:
         verbose: bool = True,
         target_level: int = None,
     ) -> List[Dict]:
-        """Run a list of inputs as one learning episode."""
         results = []
         for inp in inputs:
             r = self.run_cycle(inp, target_level=target_level)
@@ -178,78 +162,62 @@ class HGLSystem:
                 self._print_cycle(r)
         return results
 
-    # ── Generation ────────────────────────────────────────────────
+    # ── Dataset ingestion (pre-training) ──────────────────────────
 
-    def generate(self, prompt: str) -> str:
+    def ingest_text(
+        self,
+        text: str,
+        level: int = None,
+        is_correction: bool = False,
+        topic_words: List[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Find the best completion for a prompt using learned structures.
+        Ingest a single text chunk for pre-training or fine-tuning.
 
-        Search strategy (in priority order):
-          1. A structure whose output starts with the prompt (prefix match)
-             — prefer longer completions over shorter ones
-          2. A structure whose output equals the prompt exactly
-          3. Closest match by string similarity across all levels
+        Pre-training  (is_correction=False): feeds through run_cycle(),
+          normal learning at the specified level.
+
+        Fine-tuning   (is_correction=True): uses learn_correction(),
+          tags structures with topic_words so teacher content dominates
+          for matching topic queries.
+
+        Call this in a loop from the dataset ingestor.
         """
-        best_struct = None
-        best_score  = -1.0
-        top_level   = self.curriculum.get_active_level()
+        text = self.sensory_motor.receive_input(text)
+        if not text:
+            return {'error': 'empty input'}
 
-        # Search from highest level downward so richer structures win ties
-        for level in range(top_level, -1, -1):
-            for struct in self.library.get_at_level(level, kind='success'):
-                generated = struct.generate(self.library)
-                score     = self._generation_score(generated, prompt, struct.fitness)
-                if score > best_score:
-                    best_score  = score
-                    best_struct = struct
+        if level is None:
+            level = self.curriculum.get_active_level()
 
-            # If we already found a high-confidence prefix match, stop descending
-            if best_score >= 2.4:
-                break
+        if is_correction:
+            if topic_words is None:
+                topic_words = list(HierarchicalGenerativeUnit._extract_topics(text))
+            results = self.units[level].learn_correction(text, topic_words=topic_words)
+            successes = sum(1 for _, o, _ in results if o == 'success')
+            return {
+                'text':       text,
+                'level':      level,
+                'mode':       'correction',
+                'successes':  successes,
+                'lib_size':   len(self.library),
+            }
+        else:
+            return self.run_cycle(text, target_level=level)
 
-        return best_struct.generate(self.library) if best_struct else ''
-
-    @staticmethod
-    def _generation_score(generated: str, prompt: str, fitness: float = 1.0) -> float:
-        """
-        Score a candidate structure for the given prompt.
-
-        Priority:
-          1. Prefix match weighted by fitness  (score ≥ 2.0)
-             — prefers high-fitness structures over longer corrupt ones
-          2. Exact match                       (score = 1.5)
-          3. Generated is a fragment of prompt (score < 1.0)
-          4. General similarity                (score < 0.5)
-        """
-        if not generated:
-            return 0.0
-        if generated == prompt:
-            return 1.5
-        if generated.startswith(prompt):
-            # Weight by fitness: a tested, clean structure beats a corrupt longer one
-            return 2.0 + fitness * 0.5
-        if prompt.startswith(generated):
-            return len(generated) / len(prompt) * 0.8
-        return SequenceMatcher(None, generated, prompt).ratio() * 0.5
-
-    # ── Dialogue ──────────────────────────────────────────────────
+    # ── Generation / chat ─────────────────────────────────────────
 
     def respond(self, user_input: str) -> str:
         """
-        Generate a response using the generative unit directly.
-        Same unit that learns also generates — no separate modules.
-
-        Flow:
-          1. Generative unit at active level generates from library
-          2. Falls back to lower levels if active level has no relevant content
-          3. LLM parent corrects if wrong — correction learned immediately
+        Generate a response to user input.
+        Tries active level first, falls back through levels.
+        LLM parent corrects if wrong (uses learn_correction internally).
         """
         text = self.sensory_motor.receive_input(user_input)
-        self.memory.clear()   # fresh start for each new question
+        self.memory.clear()
         self.memory.push(text)
         context = self.memory.get_context()
 
-        # Try active level first, fall back through levels
         level    = self.curriculum.get_active_level()
         response = ''
         for lvl in range(level, -1, -1):
@@ -257,19 +225,12 @@ class HGLSystem:
             if response:
                 break
 
-        # LLM correction
         if response and self.llm_parent and self.llm_parent._active():
             response = self._parent_correct(text, response)
 
         return response
 
     def _parent_correct(self, user_input: str, response: str) -> str:
-        """
-        Ask the LLM parent to evaluate Deepak's response.
-        If wrong: mark as failure, propose correction, learn it.
-        If right: reinforce the structures that produced it.
-        """
-        # Ask parent: is this a good response for Little Deepak?
         context = (
             f"Someone said to Little Deepak: '{user_input}'. "
             f"Little Deepak replied: '{response}'. "
@@ -278,10 +239,9 @@ class HGLSystem:
         judgment, confidence = self.llm_parent.judge(response, context=context)
 
         if judgment in ('bad',) and confidence > 0.5:
-            # Response is wrong — ask parent for the correct version
             correction = self._request_correction(user_input, response)
             if correction and correction != response:
-                # Mark original response as failure
+                # Mark original as failure
                 bad_struct = GenerativeStructure(
                     level=self.curriculum.get_active_level(),
                     elements=list(response),
@@ -290,17 +250,21 @@ class HGLSystem:
                 )
                 self.library.add_failure(bad_struct)
 
-                # Learn the corrected version
-                self.run_cycle(correction)
+                # Learn correction with topic tagging
+                topic_words = list(
+                    HierarchicalGenerativeUnit._extract_topics(user_input)
+                )
+                level = self.curriculum.get_active_level()
+                self.units[level].learn_correction(
+                    correction, topic_words=topic_words
+                )
                 return correction
 
         return response
 
     def _request_correction(self, user_input: str, bad_response: str) -> str:
-        """Ask the LLM parent what Little Deepak should have said."""
         if not self.llm_parent or not self.llm_parent._active():
             return bad_response
-
         prompt = (
             f"Someone said to Little Deepak: '{user_input}'.\n"
             f"Little Deepak said: '{bad_response}' — this is wrong or unnatural.\n\n"
@@ -311,7 +275,6 @@ class HGLSystem:
         )
         try:
             corrected = self.llm_parent._call(prompt, max_tokens=60).strip()
-            # Clean up: lowercase, strip quotes
             corrected = corrected.lower().strip().strip('"\'')
             if len(corrected) > 3:
                 return corrected
@@ -319,17 +282,16 @@ class HGLSystem:
             pass
         return bad_response
 
+    # ── Exploration ───────────────────────────────────────────────
+
+    def explore(self, n: int = 60):
+        return self.explorer.explore(n=n)
+
     # ── Persistence ───────────────────────────────────────────────
 
     def save(self, path: str = 'deepak_memory.json') -> None:
-        """
-        Save Little Deepak's library to disk.
-        Writes to a temp file first then renames — prevents corruption
-        if the process is interrupted mid-write.
-        Also keeps a .bak of the previous good save.
-        """
         data = {
-            'version':          '0.4',
+            'version':          '0.5',
             'persona':          'Little Deepak',
             'curriculum_stage': int(self.curriculum.current_stage),
             'library':          self.library.to_dict(),
@@ -337,8 +299,6 @@ class HGLSystem:
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-
-        # Rotate: current → .bak, tmp → current
         backup = path + '.bak'
         if os.path.exists(path):
             if os.path.exists(backup):
@@ -348,10 +308,6 @@ class HGLSystem:
         print(f"[Memory] Saved {len(self.library)} structures → {path}")
 
     def load(self, path: str = 'deepak_memory.json') -> bool:
-        """
-        Load a previously saved library from disk.
-        Returns True if loaded, False if file not found or corrupted.
-        """
         if not os.path.exists(path):
             return False
         try:
@@ -372,14 +328,10 @@ class HGLSystem:
                 print("[Memory] No backup found — starting fresh.")
                 return False
 
-        # Restore library
         self.library = Library.from_dict(data['library'])
-
-        # Restore curriculum stage
         stage = data.get('curriculum_stage', 0)
         self.curriculum.current_stage = Stage(stage)
 
-        # Rewire all modules that hold a library reference
         self.tester.llm_parent = self.llm_parent
         self.explorer.library  = self.library
         for unit in self.units.values():
@@ -391,18 +343,7 @@ class HGLSystem:
         )
         return True
 
-    # ── Exploration ───────────────────────────────────────────────
-
-    def explore(self, n: int = 60):
-        """
-        Run n internal exploration attempts.
-        The hypothesis engine connects dots between established
-        library structures and tests if novel combinations hold.
-        No external input needed.
-        """
-        return self.explorer.explore(n=n)
-
-    # ── Introspection ─────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────
 
     def stats(self) -> Dict:
         s = {
