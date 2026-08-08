@@ -56,7 +56,7 @@ ADVANCEMENT_THRESHOLDS: Dict[Stage, int] = {
     # META_REASONING: final stage — no threshold
 }
 
-_CHARS = list("abcdefghijklmnopqrstuvwxyz.,!?'-")
+_CHARS = list("abcdefghijklmnopqrstuvwxyz0123456789.,!?'-")
 _ALL   = _CHARS + [' ']
 
 # Seed content per stage — sourced entirely from persona
