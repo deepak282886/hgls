@@ -1,17 +1,10 @@
 """
 structures.py — Core unit of knowledge in the HGLS.
 
-A GenerativeStructure knows how to reconstruct some input.
-Elements are either primitive characters or IDs of lower-level
-structures stored in the Library.
-
-New in this version:
-  - generate_with_trace() — returns text + which struct contributed each char
-  - correction_count      — how many times a teacher corrected to this structure
-  - reward_count          — cumulative token-level reward hits
-  - penalty_count         — cumulative token-level penalty hits
-  - topic_tags            — topics this structure is relevant to
-  - effective_fitness()   — fitness boosted by correction history for matching topics
+Key fix in this version:
+  effective_fitness() — corrections now dominate with a strong multiplier.
+  A teacher-corrected structure for a matching topic will always
+  score higher than any incidentally matching structure.
 """
 
 import uuid
@@ -25,41 +18,23 @@ if TYPE_CHECKING:
 
 @dataclass
 class GenerativeStructure:
-    """
-    A structure that can reconstruct (generate) some input.
-
-    Elements are either:
-      - Primitive characters  (single-char str)
-      - Structure IDs         (8-char hex str referencing the Library)
-
-    Level:
-      0 = characters
-      1 = combinations / syllables
-      2 = words
-      3 = phrases / sentences
-      4 = schemas
-      5 = reasoning patterns
-      6 = meta-reasoning
-    """
     id: str             = field(default_factory=lambda: str(uuid.uuid4())[:8])
     level: int          = 0
     elements: List[Any] = field(default_factory=list)
-    source: str         = "generated"   # generated|mutated|abstracted|llm|bootstrap|correction
+    source: str         = "generated"
     fitness: float      = 0.0
     generation: int     = 0
     description: str    = ""
     test_count: int     = 0
 
-    # Reward tracking
     correction_count: int = 0
     reward_count: int     = 0
     penalty_count: int    = 0
     topic_tags: List[str] = field(default_factory=list)
 
-    # ── Core generation ───────────────────────────────────────────
+    # ── Generation ────────────────────────────────────────────────
 
     def generate(self, library: Optional['Library'] = None) -> str:
-        """Reconstruct output by recursively expanding all elements."""
         parts = []
         for elem in self.elements:
             if isinstance(elem, str) and len(elem) == 1:
@@ -75,81 +50,72 @@ class GenerativeStructure:
         library: Optional['Library'] = None,
         _depth: int = 0,
     ) -> Tuple[str, List[Tuple[str, int, int]]]:
-        """
-        Reconstruct output AND record which structure contributed each character.
-
-        Returns
-        -------
-        text  : the generated string
-        trace : list of (struct_id, char_start, char_end)
-                Every character is attributed to its contributing structures.
-                A character can appear in multiple trace entries (child + parent).
-
-        This enables hierarchical reward propagation: when a token at
-        positions [s, e] is correct, every struct_id in that span is rewarded
-        all the way down the hierarchy.
-        """
         if _depth > 12:
             return '', []
-
         parts: List[str] = []
         trace: List[Tuple[str, int, int]] = []
         pos = 0
-
         for elem in self.elements:
             if isinstance(elem, str) and len(elem) == 1:
-                # Primitive — this structure owns this character
                 parts.append(elem)
                 trace.append((self.id, pos, pos + 1))
                 pos += 1
-
             elif library is not None and library.has(elem):
-                # Recurse into child structure
                 child = library.get(elem)
                 child_text, child_trace = child.generate_with_trace(library, _depth + 1)
                 parts.append(child_text)
                 for sid, cs, ce in child_trace:
                     trace.append((sid, pos + cs, pos + ce))
-                # This structure also owns the whole child span
                 if child_text:
                     trace.append((self.id, pos, pos + len(child_text)))
                 pos += len(child_text)
-
             else:
-                # Literal multi-char fallback
                 s = str(elem)
                 parts.append(s)
                 trace.append((self.id, pos, pos + len(s)))
                 pos += len(s)
-
         return ''.join(parts), trace
 
     # ── Contextual fitness ────────────────────────────────────────
 
     def effective_fitness(self, topic_words: set = None) -> float:
         """
-        Fitness adjusted by correction history and token-level reward signal.
+        Fitness adjusted for corrections and topic relevance.
 
-        Teacher corrections dominate for matching topics.
-        Token reward history shifts fitness up or down based on
-        how consistently this structure generated correct tokens.
+        Corrections dominate. A structure explicitly taught as a
+        correction for a matching topic gets a strong multiplier —
+        not a small nudge. This ensures corrections always surface
+        above incidentally matching corpus sentences.
+
+        Scoring:
+          base fitness from reconstruction quality
+          + correction bonus (large, topic-aware)
+          + token reward ratio signal
         """
         base = self.fitness
 
-        # Correction bonus
         if self.correction_count > 0:
             if topic_words and self.topic_tags:
-                overlap = len(topic_words & set(self.topic_tags))
-                boost = 0.15 * self.correction_count if overlap > 0 else 0.02 * self.correction_count
-            else:
-                boost = 0.05 * self.correction_count
-            base = min(1.0, base + boost)
+                tag_set = set(self.topic_tags)
+                overlap = len(topic_words & tag_set)
 
-        # Token reward ratio
+                if overlap > 0:
+                    # Strong bonus for matching topic corrections
+                    # Each correction adds 0.5 to effective fitness (capped at 1.0)
+                    # This ensures corrections always beat corpus sentences
+                    base = min(1.0, base + 0.5 * self.correction_count)
+                else:
+                    # Small bonus for corrections on other topics
+                    base = min(1.0, base + 0.05 * self.correction_count)
+            else:
+                # No topic context — modest bonus
+                base = min(1.0, base + 0.1 * self.correction_count)
+
+        # Token reward history — fine-grained signal after many observations
         total = self.reward_count + self.penalty_count
-        if total >= 5:
-            ratio = self.reward_count / total
-            base = max(0.0, min(1.0, base + (ratio - 0.5) * 0.4))
+        if total >= 10:
+            ratio  = self.reward_count / total
+            base   = max(0.0, min(1.0, base + (ratio - 0.5) * 0.3))
 
         return base
 
@@ -160,7 +126,6 @@ class GenerativeStructure:
         primitives: List[str],
         library: Optional['Library'] = None,
     ) -> 'GenerativeStructure':
-        """Return a new mutated copy. Leaves this structure untouched."""
         elems = list(self.elements)
         if not elems:
             elems = [random.choice(primitives)]
@@ -173,10 +138,8 @@ class GenerativeStructure:
         if op == 'insert' and len(elems) < 24:
             idx = random.randint(0, len(elems))
             elems.insert(idx, random.choice(primitives))
-
         elif op == 'delete' and len(elems) > 1:
             elems.pop(random.randint(0, len(elems) - 1))
-
         elif op == 'replace' and elems:
             idx = random.randint(0, len(elems) - 1)
             if library and random.random() < 0.25:
@@ -184,7 +147,6 @@ class GenerativeStructure:
                 elems[idx] = random.choice(lower).id if lower else random.choice(primitives)
             else:
                 elems[idx] = random.choice(primitives)
-
         elif op == 'swap' and len(elems) > 1:
             i, j = random.sample(range(len(elems)), 2)
             elems[i], elems[j] = elems[j], elems[i]
@@ -234,6 +196,6 @@ class GenerativeStructure:
     def __repr__(self):
         return (
             f"GenStruct(id={self.id}, lvl={self.level}, "
-            f"elems={self.elements[:6]}, fit={self.fitness:.2f}, "
-            f"src={self.source}, corr={self.correction_count})"
+            f"fit={self.fitness:.2f}, corr={self.correction_count}, "
+            f"tags={self.topic_tags[:3]})"
         )
