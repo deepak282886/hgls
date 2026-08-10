@@ -1,12 +1,11 @@
 """
 system.py — HGLSystem v0.7
 
-Cleaned:
-  - _parent_correct and _request_correction removed
-  - respond() is pure internal generation, no LLM correction
-  - Tinkering moved out of run_cycle — syllabus_teacher controls it
-  - Single save/load pattern, graph saved alongside memory
-  - auto_driver dependency removed
+All internal systems now wired into both learning paths:
+  - correction path: co_occurrence, reward, emotional_evaluator, navigator
+  - respond path: emotional_evaluator, navigator
+  - New: reinforce_correct_response() and penalise_wrong_response()
+  - Tinkering: no minimum edge count
 """
 
 import os
@@ -48,13 +47,15 @@ class HGLSystem:
             graph=self.graph, library=self.library
         )
         self.navigator    = GraphNavigator(
-            graph=self.graph, library=self.library, evaluator=self.emotional_evaluator
+            graph=self.graph, library=self.library,
+            evaluator=self.emotional_evaluator,
         )
         self.tinkering    = TinkeringEngine(
-            graph=self.graph, library=self.library, evaluator=self.emotional_evaluator
+            graph=self.graph, library=self.library,
+            evaluator=self.emotional_evaluator,
         )
         self.co_occurrence = CoOccurrenceDetector(
-            library=self.library, graph=self.graph
+            library=self.library, graph=self.graph,
         )
         self.llm_validator = LLMValidator()
         self.tester        = ExtremeTester()
@@ -96,7 +97,9 @@ class HGLSystem:
         level    = target_level if target_level is not None else self.curriculum.get_active_level()
         salience = self.attention.compute_salience(text, level)
         n_hyp    = self.attention.allocate_hypotheses(14, salience)
-        meta     = self.navigator.analyse(text, level=level)
+
+        # Navigator reads graph topology
+        meta = self.navigator.analyse(text, level=level)
 
         unit          = self.units[level]
         cycle_results = unit.learn(text, n_hypotheses=n_hyp)
@@ -106,13 +109,15 @@ class HGLSystem:
                 if struct.level >= 3:
                     self.co_occurrence.observe_phrase(struct.id)
                 self.self_model.mark_self_generated(struct)
+                self.reward.compute_reward(struct, outcome, score)
 
         if cycle_results:
             best_score   = max(sc for _, _, sc in cycle_results)
             top_strategy = max(meta.strategy_weights, key=meta.strategy_weights.get)
             self.navigator.update_from_outcome(top_strategy, best_score)
             best_struct, _, _ = max(cycle_results, key=lambda x: x[2])
-            self.emotional_evaluator.evaluate(best_struct.generate(self.library), text)
+            generated = best_struct.generate(self.library)
+            self.emotional_evaluator.evaluate(generated, text)
 
         if target_level is None:
             self.curriculum.tick()
@@ -152,10 +157,26 @@ class HGLSystem:
             if topic_words is None:
                 topic_words = list(HierarchicalGenerativeUnit._extract_topics(text))
             results   = self.units[level].learn_correction(text, topic_words=topic_words)
-            successes = sum(1 for _, o, _ in results if o == 'success')
-            for struct, outcome, _ in results:
-                if outcome == 'success' and struct.level >= 3:
-                    self.co_occurrence.observe_phrase(struct.id)
+            successes = 0
+
+            for struct, outcome, score in results:
+                if outcome == 'success':
+                    successes += 1
+                    # Wire co-occurrence for phrase-level corrections
+                    if struct.level >= 3:
+                        self.co_occurrence.observe_phrase(struct.id)
+                    # Wire reward system
+                    self.reward.compute_reward(struct, outcome, score)
+                    self.self_model.mark_self_generated(struct)
+
+            # Navigator learns from correction context
+            if results:
+                meta = self.navigator.analyse(text, level=level)
+                best_score = max((sc for _, o, sc in results if o == 'success'), default=0.0)
+                if best_score > 0:
+                    top_strategy = max(meta.strategy_weights, key=meta.strategy_weights.get)
+                    self.navigator.update_from_outcome(top_strategy, best_score)
+
             return {
                 'text':      text,
                 'level':     level,
@@ -168,22 +189,113 @@ class HGLSystem:
     # ── Generation ────────────────────────────────────────────────
 
     def respond(self, user_input: str) -> str:
+        """
+        Generate response. Wires emotional evaluator and navigator
+        so they accumulate signal from every query.
+        """
         text = self.sensory_motor.receive_input(user_input)
         self.memory.clear()
         self.memory.push(text)
-        context  = self.memory.get_context()
-        level    = self.curriculum.get_active_level()
+        context = self.memory.get_context()
+
+        # Navigator reads graph topology for this query
+        level = self.curriculum.get_active_level()
+        meta  = self.navigator.analyse(text, level=level)
+
+        # Generate from all levels
         response = ''
-        for lvl in range(level, -1, -1):
-            response = self.units[lvl].generate(text, context=context)
-            if response:
+        for lvl in range(6, -1, -1):
+            candidate = self.units[lvl].generate(text, context=context)
+            if candidate and 'not sure' not in candidate.lower():
+                response = candidate
                 break
+        if not response:
+            response = self.units[0].generate(text, context=context)
+
+        # Emotional evaluator scores the response — accumulates signal
+        if response:
+            self.emotional_evaluator.evaluate(response, text)
+
         return response
 
-    # ── Tinkering (called by syllabus_teacher) ────────────────────
+    # ── Reinforcement after evaluation ────────────────────────────
+
+    def reinforce_correct_response(
+        self,
+        response:    str,
+        topic_words: List[str],
+    ) -> None:
+        """
+        System answered correctly. Reward every structure that
+        contributed to generating the right response.
+        This closes the positive reinforcement loop.
+        """
+        response_words = set(response.lower().split())
+        topic_set      = set(topic_words)
+
+        for level in range(7):
+            for struct in self.library.get_at_level(level, 'success'):
+                text = struct.generate(self.library)
+                if not text:
+                    continue
+                text_words = set(text.lower().split())
+                if len(text_words) < 2:
+                    continue
+
+                # Check if this structure's text appears substantially in response
+                overlap = len(text_words & response_words)
+                if overlap < max(1, len(text_words) // 2):
+                    continue
+
+                # Reward this structure
+                struct.reward_count += 1
+                struct.fitness = min(1.0, struct.fitness + 0.03)
+
+                # Extra boost for correction-tagged structures on matching topic
+                if struct.correction_count > 0 and struct.topic_tags:
+                    tag_overlap = len(topic_set & set(struct.topic_tags))
+                    if tag_overlap > 0:
+                        struct.fitness = min(1.0, struct.fitness + 0.05)
+                        struct.correction_count += 1  # strengthen further
+
+    def penalise_wrong_response(
+        self,
+        response:    str,
+        topic_words: List[str],
+    ) -> None:
+        """
+        System answered wrongly. Penalise non-correction structures
+        that generated the wrong response. Corrections are never penalised.
+        """
+        if not response or 'not sure' in response.lower():
+            return  # honest uncertainty — don't penalise
+
+        response_words = set(response.lower().split())
+
+        for level in range(3, 7):
+            for struct in self.library.get_at_level(level, 'success'):
+                # Never penalise correction-tagged structures
+                if struct.correction_count > 0:
+                    continue
+
+                text = struct.generate(self.library)
+                if not text:
+                    continue
+                text_words = set(text.lower().split())
+                if len(text_words) < 2:
+                    continue
+
+                # Check if this structure appeared in wrong response
+                overlap = len(text_words & response_words)
+                if overlap >= max(1, len(text_words) // 2):
+                    struct.penalty_count += 1
+                    struct.fitness = max(0.0, struct.fitness - 0.02)
+
+    # ── Tinkering (no minimum edge count) ─────────────────────────
 
     def run_tinkering(self) -> dict:
-        if len(self.graph) < 50:
+        """Run tinkering engine. No minimum edge requirement."""
+        if len(self.graph) < 2:
             return {'proposals': 0, 'accepted': 0}
         proposals = self.tinkering.tinker()
         if not proposals:
@@ -221,7 +333,6 @@ class HGLSystem:
 
         graph_path = path.replace('.json', '_graph.json')
         self.graph.save(graph_path)
-
         print(f"[Memory] {len(self.library)} structures + {len(self.graph)} edges → {path}")
 
     def load(self, path: str = 'deepak_memory.json') -> bool:
@@ -237,7 +348,7 @@ class HGLSystem:
                 try:
                     with open(backup, encoding='utf-8') as f:
                         data = json.load(f)
-                    print(f"[Memory] Loaded from backup.")
+                    print("[Memory] Loaded from backup.")
                 except Exception:
                     return False
             else:
@@ -248,11 +359,11 @@ class HGLSystem:
 
         for unit in self.units.values():
             unit.library = self.library
-        self.explorer.library        = self.library
-        self.co_occurrence.library   = self.library
+        self.explorer.library            = self.library
+        self.co_occurrence.library       = self.library
         self.emotional_evaluator.library = self.library
-        self.navigator.library       = self.library
-        self.tinkering.library       = self.library
+        self.navigator.library           = self.library
+        self.tinkering.library           = self.library
 
         graph_path = path.replace('.json', '_graph.json')
         self.graph.load(graph_path)
@@ -267,15 +378,15 @@ class HGLSystem:
 
     def stats(self) -> Dict:
         return {
-            'cycles':             self._cycle_count,
-            'library':            self.library.stats(),
-            'graph':              self.graph.stats(),
-            'curriculum':         self.curriculum.stats(),
-            'reward':             self.reward.stats(),
+            'cycles':              self._cycle_count,
+            'library':             self.library.stats(),
+            'graph':               self.graph.stats(),
+            'curriculum':          self.curriculum.stats(),
+            'reward':              self.reward.stats(),
             'emotional_evaluator': self.emotional_evaluator.stats(),
-            'navigator':          self.navigator.stats(),
-            'tinkering':          self.tinkering.stats(),
-            'tester':             self.tester.stats(),
+            'navigator':           self.navigator.stats(),
+            'tinkering':           self.tinkering.stats(),
+            'tester':              self.tester.stats(),
         }
 
     def print_stats(self) -> None:
