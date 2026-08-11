@@ -19,7 +19,8 @@ env/
 .hgls/
 
 # Memory / saved state
-deepak_memory.json
+knowledge.json
+knowledge.json.bak
 
 # IDE
 .vscode/

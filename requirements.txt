@@ -1,2 +1,0 @@
-# Together AI uses OpenAI-compatible API
-openai>=1.0.0
