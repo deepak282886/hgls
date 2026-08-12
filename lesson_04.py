@@ -64,7 +64,7 @@ def teach(s: System) -> None:
     print('\n[Phase 1] Mama says ball — text + mama voice, 15 reps')
     for rep in range(15):
         patches = [BALL_BRIGHT, BALL_MID, BALL_FAR][rep % 3]
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('ball',
             text_atoms   = BALL_TEXT,
             voice_atoms  = BALL_VOICE_MAMA,
             vision_atoms = patches,
@@ -80,7 +80,7 @@ def teach(s: System) -> None:
     for rep in range(10):
         voice = BALL_VOICE_PAPA if rep % 2 == 0 else BALL_VOICE_MAMA
         patches = [BALL_BRIGHT, BALL_MID][rep % 2]
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('ball',
             text_atoms   = BALL_TEXT,
             voice_atoms  = voice,
             vision_atoms = patches,
@@ -96,7 +96,7 @@ def teach(s: System) -> None:
     for phrase_text in [ROLL_BALL, BIG_BALL, YOUR_BALL]:
         for rep in range(5):
             voice = BALL_VOICE_MAMA if rep % 2 == 0 else BALL_VOICE_PAPA
-            paths, cross, avg = s.learn_multi(
+            paths, cross, avg = s.teach_concept(s.text_from_atoms(phrase_text),
                 text_atoms   = phrase_text,
                 voice_atoms  = voice,
                 vision_atoms = BALL_BRIGHT,
@@ -107,6 +107,12 @@ def teach(s: System) -> None:
         )
         print(f"  phrase taught  cross={cross:.4f}  avg={avg:.0f}")
 
+
+    # Register concepts in the graph
+    s.register_concept('ball')
+    s.register_concept('roll the ball')
+    s.register_concept('big ball')
+    s.register_concept('your ball')
     s.save()
 
 

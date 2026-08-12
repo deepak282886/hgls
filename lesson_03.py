@@ -54,7 +54,7 @@ def teach(s: System) -> None:
     # ── Phase 1: word alone ───────────────────────────────────────
     print('\n[Phase 1] Word alone — text + voice, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('ball',
             text_atoms  = BALL_TEXT,
             voice_atoms = BALL_VOICE,
             reward      = True,
@@ -67,7 +67,7 @@ def teach(s: System) -> None:
     # ── Phase 2: word + sight ─────────────────────────────────────
     print('\n[Phase 2] Word + sight — all three modalities, 15 reps')
     for rep in range(15):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('ball',
             text_atoms   = BALL_TEXT,
             voice_atoms  = BALL_VOICE,
             vision_atoms = BALL_PATCHES,
@@ -83,7 +83,7 @@ def teach(s: System) -> None:
     for rep in range(15):
         # alternate between bright and dim ball
         patches = BALL_PATCHES if rep % 2 == 0 else BALL_PATCHES_DIM
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('ball',
             text_atoms   = BALL_TEXT,
             voice_atoms  = BALL_VOICE,
             vision_atoms = patches,
@@ -92,6 +92,9 @@ def teach(s: System) -> None:
         if (rep + 1) % 5 == 0:
             print(f"  rep {rep+1:2d}  cross={cross:.4f}  avg={avg:.0f}")
 
+
+    # Register concepts in the graph
+    s.register_concept('ball')
     s.save()
 
 

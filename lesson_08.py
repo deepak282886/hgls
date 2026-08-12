@@ -75,7 +75,7 @@ def teach(s: System) -> None:
     for rep in range(10):
         voice   = BOOK_VOICE_PAPA if rep % 2 == 0 else BOOK_VOICE_MAMA
         patches = BOOK_PATCHES if rep % 3 != 2 else BOOK_PATCHES_BRIGHT
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('book',
             text_atoms   = BOOK_TEXT,
             voice_atoms  = voice,
             vision_atoms = patches,
@@ -87,7 +87,7 @@ def teach(s: System) -> None:
     for phrase in [LOOK_BOOK, OPEN_BOOK, NICE_BOOK]:
         for rep in range(5):
             voice = BOOK_VOICE_MAMA if rep % 2 == 0 else BOOK_VOICE_PAPA
-            s.learn_multi(
+            s.teach_concept(s.text_from_atoms(phrase),
                 text_atoms   = phrase,
                 voice_atoms  = voice,
                 vision_atoms = BOOK_PATCHES,
@@ -100,7 +100,7 @@ def teach(s: System) -> None:
     # ── Part B: Light core ────────────────────────────────────────
     print('\n[Part B] Light — word alone, papa first, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('light',
             text_atoms  = LIGHT_TEXT,
             voice_atoms = LIGHT_VOICE_PAPA,
             reward      = True,
@@ -110,7 +110,7 @@ def teach(s: System) -> None:
 
     print('\n[Part B] Light on — word + bright vision, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('light',
             text_atoms   = LIGHT_TEXT,
             voice_atoms  = LIGHT_VOICE_PAPA,
             vision_atoms = LIGHT_ON,
@@ -122,7 +122,7 @@ def teach(s: System) -> None:
     print('\n[Part B] Light off — same word, dark vision, 10 reps')
     for rep in range(10):
         voice = LIGHT_VOICE_PAPA if rep % 2 == 0 else LIGHT_VOICE_MAMA
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('light',
             text_atoms   = LIGHT_TEXT,
             voice_atoms  = voice,
             vision_atoms = LIGHT_OFF,
@@ -139,7 +139,7 @@ def teach(s: System) -> None:
     ]:
         for rep in range(5):
             voice = LIGHT_VOICE_MAMA if rep % 2 == 0 else LIGHT_VOICE_PAPA
-            s.learn_multi(
+            s.teach_concept(s.text_from_atoms(phrase),
                 text_atoms   = phrase,
                 voice_atoms  = voice,
                 vision_atoms = patches,
@@ -147,6 +147,14 @@ def teach(s: System) -> None:
             )
         print(f"  phrase done")
 
+
+    # Register concepts in the graph
+    s.register_concept('book')
+    s.register_concept('look at the book')
+    s.register_concept('open the book')
+    s.register_concept('light')
+    s.register_concept('light is on')
+    s.register_concept('light is off')
     s.save()
 
 

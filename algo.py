@@ -211,6 +211,83 @@ class Algo:
                 return True
         return False
 
+    # ── Bottom-up propagation ─────────────────────────────────────
+
+    def propagate_up(self, atom_ids: List[str], modality: str = 'text') -> List:
+        """
+        Given activated input atoms, propagate activation UPWARD
+        through the graph to find the best matching concept.
+
+        For each concept node, score = active_edge_strength / total_edge_strength
+        weighted by input coverage.
+
+        Only counts level-0 atoms of the same modality as the input
+        — prevents voice atoms and strategy nodes (added by tinkerer)
+        from distorting text-based concept matching.
+
+        Returns list of (concept_node, score) sorted descending.
+        """
+        input_set     = set(atom_ids)
+        input_modality = modality
+        scores        = {}
+
+        input_count = len(input_set)
+
+        for node in self.graph._nodes.values():
+            if node.modality != 'concept':
+                continue
+
+            active_strength = 0.0
+            total_strength  = 0.0
+            active_count    = 0
+
+            for neighbour, edge in self.graph.neighbours(node.id):
+                # Only count level-0 atoms of the same modality as the input.
+                # Concept nodes can have edges to voice atoms, strategy nodes etc.
+                # from tinkerer activity — those must not interfere with text recognition.
+                if neighbour.level == 0 and neighbour.modality == input_modality:
+                    total_strength += edge.strength
+                    if neighbour.id in input_set:
+                        active_strength += edge.strength
+                        active_count    += 1
+
+            if total_strength > 0 and active_strength > 0:
+                # How much of this concept is activated by the input
+                concept_coverage = active_strength / total_strength
+                # How much of the input is explained by this concept
+                input_coverage   = active_count / max(input_count, 1)
+                # Base score: both coverages must be high
+                base = concept_coverage * input_coverage
+
+                # Substring bonus: if the input text appears as a substring
+                # inside the concept's stored text, it is a stronger match.
+                # This uses the concept node's own element — still graph-based.
+                concept_text  = node.elements[0] if node.elements else ''
+                input_text_reconstructed = ''.join(
+                    self.graph.get_node(aid).elements[0]
+                    for aid in atom_ids
+                    if self.graph.get_node(aid)
+                    and self.graph.get_node(aid).modality == modality
+                )
+                if (input_text_reconstructed and concept_text and
+                        input_text_reconstructed in concept_text):
+                    bonus = len(input_text_reconstructed) / max(len(concept_text), 1)
+                else:
+                    bonus = 0.0
+
+                scores[node.id] = base + bonus
+
+        results = sorted(
+            [
+                (self.graph.get_node(nid), score)
+                for nid, score in scores.items()
+                if self.graph.get_node(nid)
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return results
+
     # ── Cross-modal integration ───────────────────────────────────
 
     def integrate(

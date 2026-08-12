@@ -170,6 +170,102 @@ class System:
 
     # ── Persistence ───────────────────────────────────────────────
 
+    # ── Concept registry ─────────────────────────────────────────
+
+    def register_concept(self, text: str) -> str:
+        """
+        Register a taught concept in the graph as a level-2 node.
+        The concept node holds the original text as its element.
+        Returns the concept node id.
+        """
+        text = text.strip().lower()
+        cid  = f"concept:{text}"
+        if not self.graph.has_node(cid):
+            from memory import Node as _Node
+            node = _Node(
+                id       = cid,
+                level    = 2,
+                modality = 'concept',
+                elements = [text],
+                strength = 0.0,
+            )
+            self.graph.add_node(node)
+            # Connect concept node to its unique character atoms
+            for atom_id in set(self.text(text)):
+                self.graph.add_edge(cid, atom_id)
+        return cid
+
+    def text_from_atoms(self, atom_ids: List[str]) -> str:
+        """Reconstruct original text from a list of text atom ids."""
+        chars = []
+        for aid in atom_ids:
+            node = self.graph.get_node(aid)
+            if node and node.modality == 'text' and node.elements:
+                chars.append(node.elements[0])
+        return ''.join(chars)
+
+    def teach_concept(
+        self,
+        text:         str,
+        text_atoms:   List[str] = None,
+        voice_atoms:  List[str] = None,
+        vision_atoms: List[str] = None,
+        reward:       bool = True,
+    ) -> tuple:
+        """
+        Teach a concept and reinforce its node in one call.
+        This is the primary teaching method for lessons.
+        learn_multi builds the atom-level graph.
+        reinforce_concept strengthens the concept node upward.
+        Both happen together every rep so the concept node
+        earns proportional strength.
+        """
+        paths, cross, avg = self.learn_multi(
+            text_atoms   = text_atoms,
+            voice_atoms  = voice_atoms,
+            vision_atoms = vision_atoms,
+            reward       = reward,
+        )
+        if reward and text:
+            self.reinforce_concept(text.strip().lower())
+        return paths, cross, avg
+
+    def reinforce_concept(self, text: str) -> None:
+        """
+        Strengthen the edges between a concept node and its atoms.
+        Called during lesson teaching alongside learn_multi().
+        This is how the concept node earns its strength —
+        each teaching rep reinforces the concept-atom edges,
+        making that concept recognisable from its atoms via
+        bottom-up propagation.
+        """
+        text = text.strip().lower()
+        cid  = f"concept:{text}"
+        if not self.graph.has_node(cid):
+            self.register_concept(text)
+
+        node = self.graph.get_node(cid)
+        if node:
+            amount = 1.0 / (1.0 + node.strength)
+            node.strength += amount
+
+        for atom_id in set(self.text(text)):
+            edge = self.graph.get_edge(cid, atom_id)
+            if edge:
+                amount = 1.0 / (1.0 + edge.strength)
+                edge.reinforce(amount)
+
+    def known_concepts(self) -> List[str]:
+        """
+        Return all texts explicitly registered as concepts in the graph.
+        No hardcoded list — reads directly from graph nodes.
+        """
+        return [
+            node.elements[0]
+            for node in self.graph._nodes.values()
+            if node.modality == 'concept' and node.elements
+        ]
+
     def save(self) -> None:
         self.graph.save(self.path)
 

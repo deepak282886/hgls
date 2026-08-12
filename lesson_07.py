@@ -65,7 +65,7 @@ def teach(s: System) -> None:
     print('\n[Part A] Spoon — mama\'s voice, 10 reps')
     for rep in range(10):
         voice = SPOON_VOICE_MAMA if rep % 2 == 0 else SPOON_VOICE_PAPA
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('spoon',
             text_atoms   = SPOON_TEXT,
             voice_atoms  = voice,
             vision_atoms = SPOON_PATCHES,
@@ -78,7 +78,7 @@ def teach(s: System) -> None:
     for phrase in [EAT_SPOON, YOUR_SPOON, LITTLE_SPOON]:
         for rep in range(5):
             voice = SPOON_VOICE_MAMA if rep % 2 == 0 else SPOON_VOICE_PAPA
-            s.learn_multi(
+            s.teach_concept(s.text_from_atoms(phrase),
                 text_atoms   = phrase,
                 voice_atoms  = voice,
                 vision_atoms = SPOON_PATCHES,
@@ -91,7 +91,7 @@ def teach(s: System) -> None:
     # ── Part B: Book core ─────────────────────────────────────────
     print('\n[Part B] Book — word alone, papa first, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('book',
             text_atoms  = BOOK_TEXT,
             voice_atoms = BOOK_VOICE_PAPA,
             reward      = True,
@@ -103,7 +103,7 @@ def teach(s: System) -> None:
     for rep in range(15):
         voice   = BOOK_VOICE_PAPA if rep % 2 == 0 else BOOK_VOICE_MAMA
         patches = BOOK_PATCHES_OPEN if rep % 3 != 2 else BOOK_PATCHES_CLOSED
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('book',
             text_atoms   = BOOK_TEXT,
             voice_atoms  = voice,
             vision_atoms = patches,
@@ -116,7 +116,7 @@ def teach(s: System) -> None:
     for phrase in [READ_BOOK, YOUR_BOOK, BIG_BOOK]:
         for rep in range(5):
             voice = BOOK_VOICE_MAMA if rep % 2 == 0 else BOOK_VOICE_PAPA
-            s.learn_multi(
+            s.teach_concept(s.text_from_atoms(phrase),
                 text_atoms   = phrase,
                 voice_atoms  = voice,
                 vision_atoms = BOOK_PATCHES_OPEN,
@@ -124,6 +124,14 @@ def teach(s: System) -> None:
             )
         print(f"  phrase done")
 
+
+    # Register concepts in the graph
+    s.register_concept('spoon')
+    s.register_concept('eat with the spoon')
+    s.register_concept('your spoon')
+    s.register_concept('book')
+    s.register_concept('read the book')
+    s.register_concept('your book')
     s.save()
 
 

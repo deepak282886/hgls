@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Little Deepak</title>
+<style>
+  /* ── Tokens ───────────────────────────────────────────────── */
+  :root {
+    --bg:        #0f0e17;
+    --surface:   #1a1827;
+    --rim:       #2a2840;
+    --text:      #e8e4f0;
+    --muted:     #6b6880;
+    --accent:    #c8a96e;       /* warm gold — like a lamp */
+    --soft:      #9b8bb4;       /* lavender — curiosity */
+    --happy:     #7ec8a0;       /* sage green — recognition */
+    --curious:   #e8a87c;       /* warm orange — tinkerer */
+    --calm:      #8ab4d4;       /* soft blue — listening */
+    --font-disp: 'Georgia', serif;
+    --font-body: system-ui, sans-serif;
+    --r:         16px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 40px;
+    gap: 24px;
+  }
+
+  /* ── Header ───────────────────────────────────────────────── */
+  header {
+    text-align: center;
+  }
+  header h1 {
+    font-family: var(--font-disp);
+    font-size: 1.5rem;
+    font-weight: normal;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  header p {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  /* ── Face ─────────────────────────────────────────────────── */
+  .face-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .face {
+    width: 140px;
+    height: 140px;
+    position: relative;
+  }
+
+  .face svg {
+    width: 100%;
+    height: 100%;
+    transition: all 0.4s ease;
+  }
+
+  .state-label {
+    font-size: 0.72rem;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    min-height: 1em;
+    transition: color 0.4s ease;
+  }
+
+  /* ── Conversation ─────────────────────────────────────────── */
+  .convo {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 280px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+
+  .convo::-webkit-scrollbar { width: 4px; }
+  .convo::-webkit-scrollbar-track { background: transparent; }
+  .convo::-webkit-scrollbar-thumb { background: var(--rim); border-radius: 2px; }
+
+  .msg {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    animation: fadeup 0.3s ease;
+  }
+
+  @keyframes fadeup {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.you  { align-items: flex-end; }
+  .msg.deepak { align-items: flex-start; }
+
+  .bubble {
+    padding: 10px 14px;
+    border-radius: 18px;
+    max-width: 78%;
+    font-size: 0.9rem;
+    line-height: 1.4;
+  }
+
+  .msg.you .bubble {
+    background: var(--rim);
+    color: var(--text);
+    border-bottom-right-radius: 4px;
+  }
+
+  .msg.deepak .bubble {
+    background: var(--surface);
+    border: 1px solid var(--rim);
+    color: var(--text);
+    border-bottom-left-radius: 4px;
+  }
+
+  .msg-meta {
+    font-size: 0.66rem;
+    color: var(--muted);
+    padding: 0 4px;
+  }
+
+  /* ── Score bar ────────────────────────────────────────────── */
+  .score-row {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .score-label {
+    font-size: 0.7rem;
+    color: var(--muted);
+    white-space: nowrap;
+    width: 64px;
+    text-align: right;
+  }
+  .score-bar-bg {
+    flex: 1;
+    height: 4px;
+    background: var(--rim);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .score-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--happy);
+    border-radius: 2px;
+    transition: width 0.6s ease, background 0.4s ease;
+  }
+
+  /* ── Graph numbers ────────────────────────────────────────── */
+  .graph-row {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    gap: 10px;
+  }
+
+  .graph-chip {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--rim);
+    border-radius: 10px;
+    padding: 10px;
+    text-align: center;
+  }
+  .graph-chip .num {
+    font-size: 1.2rem;
+    font-family: var(--font-disp);
+    color: var(--accent);
+    display: block;
+  }
+  .graph-chip .lbl {
+    font-size: 0.65rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  /* ── Input area ───────────────────────────────────────────── */
+  .input-area {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  input[type=text] {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--rim);
+    border-radius: 24px;
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 0.9rem;
+    padding: 12px 18px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  input[type=text]:focus {
+    border-color: var(--soft);
+  }
+  input[type=text]::placeholder {
+    color: var(--muted);
+  }
+
+  button {
+    background: none;
+    border: 1px solid var(--rim);
+    border-radius: 50%;
+    width: 46px;
+    height: 46px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: border-color 0.2s, background 0.2s;
+    flex-shrink: 0;
+  }
+  button svg { pointer-events: none; }
+  button:hover { border-color: var(--soft); background: var(--surface); }
+  button.active { border-color: var(--curious); background: var(--surface); }
+
+  .btn-teach {
+    font-size: 0.72rem;
+    color: var(--muted);
+    background: none;
+    border: 1px dashed var(--rim);
+    border-radius: 20px;
+    padding: 6px 16px;
+    cursor: pointer;
+    font-family: var(--font-body);
+    letter-spacing: 0.04em;
+    transition: border-color 0.2s, color 0.2s;
+    width: auto;
+    height: auto;
+    border-radius: 20px;
+  }
+  .btn-teach:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .teach-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Little Deepak</h1>
+  <p id="server-status">connecting to brain…</p>
+</header>
+
+<!-- Face -->
+<div class="face-wrap">
+  <div class="face" id="face">
+    <svg id="face-svg" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
+      <!-- head -->
+      <circle cx="70" cy="70" r="60" fill="#2a2840" stroke="#3d3a5e" stroke-width="1.5"/>
+      <!-- eyes -->
+      <ellipse id="eye-l" cx="50" cy="62" rx="7" ry="8" fill="#c8a96e"/>
+      <ellipse id="eye-r" cx="90" cy="62" rx="7" ry="8" fill="#c8a96e"/>
+      <!-- pupils -->
+      <circle id="pupil-l" cx="51" cy="63" r="3.5" fill="#0f0e17"/>
+      <circle id="pupil-r" cx="91" cy="63" r="3.5" fill="#0f0e17"/>
+      <!-- mouth -->
+      <path id="mouth" d="M 54 90 Q 70 100 86 90" stroke="#c8a96e" stroke-width="2.5"
+            fill="none" stroke-linecap="round"/>
+      <!-- blush -->
+      <ellipse id="blush-l" cx="38" cy="80" rx="9" ry="5" fill="#e8a87c" opacity="0"/>
+      <ellipse id="blush-r" cx="102" cy="80" rx="9" ry="5" fill="#e8a87c" opacity="0"/>
+      <!-- tinkerer spark -->
+      <g id="spark" opacity="0">
+        <circle cx="70" cy="20" r="3" fill="#e8a87c"/>
+        <circle cx="90" cy="28" r="2" fill="#c8a96e"/>
+        <circle cx="50" cy="26" r="2" fill="#9b8bb4"/>
+      </g>
+    </svg>
+  </div>
+  <div class="state-label" id="state-label">listening</div>
+</div>
+
+<!-- Conversation -->
+<div class="convo" id="convo"></div>
+
+<!-- Score bar -->
+<div class="score-row">
+  <span class="score-label">recognition</span>
+  <div class="score-bar-bg">
+    <div class="score-bar-fill" id="score-fill"></div>
+  </div>
+</div>
+
+<!-- Graph numbers -->
+<div class="graph-row">
+  <div class="graph-chip">
+    <span class="num" id="g-nodes">—</span>
+    <span class="lbl">nodes</span>
+  </div>
+  <div class="graph-chip">
+    <span class="num" id="g-edges">—</span>
+    <span class="lbl">edges</span>
+  </div>
+  <div class="graph-chip">
+    <span class="num" id="g-l1">—</span>
+    <span class="lbl">abstractions</span>
+  </div>
+</div>
+
+<!-- Input -->
+<div class="input-area">
+  <div class="input-row">
+    <input type="text" id="text-input" placeholder="say something to deepak…" autocomplete="off"/>
+    <button id="mic-btn" title="speak">
+      <!-- mic icon -->
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+           stroke="#9b8bb4" stroke-width="2" stroke-linecap="round">
+        <rect x="9" y="2" width="6" height="11" rx="3"/>
+        <path d="M5 10a7 7 0 0 0 14 0"/>
+        <line x1="12" y1="19" x2="12" y2="22"/>
+        <line x1="9"  y1="22" x2="15" y2="22"/>
+      </svg>
+    </button>
+    <button id="send-btn" title="send">
+      <!-- send icon -->
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+           stroke="#c8a96e" stroke-width="2" stroke-linecap="round">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+  <div class="teach-row">
+    <button class="btn-teach" id="teach-btn">+ teach deepak this</button>
+    <span style="font-size:0.7rem;color:var(--muted)">rewards and saves to memory</span>
+  </div>
+</div>
+
+<script>
+const API = 'http://localhost:5000';
+
+// ── State ──────────────────────────────────────────────────────
+let lastInput  = '';
+let isListening = false;
+let recognition = null;
+
+// ── Voice synthesis ────────────────────────────────────────────
+const synth = window.speechSynthesis;
+
+function speak(text) {
+  if (!text) return;
+  synth.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  // pick a child-like, soft voice if available
+  const voices = synth.getVoices();
+  const preferred = voices.find(v =>
+    v.name.includes('child') || v.name.includes('junior') ||
+    v.name.toLowerCase().includes('samantha') ||
+    v.name.toLowerCase().includes('karen') ||
+    (v.lang === 'en-US' && v.name.includes('Female'))
+  ) || voices.find(v => v.lang.startsWith('en')) || voices[0];
+  if (preferred) utt.voice = preferred;
+  utt.rate   = 0.82;
+  utt.pitch  = 1.35;
+  utt.volume = 1.0;
+  synth.speak(utt);
+}
+
+// preload voices
+synth.onvoiceschanged = () => synth.getVoices();
+
+// ── Face states ────────────────────────────────────────────────
+const face      = document.getElementById('face-svg');
+const eyeL      = document.getElementById('eye-l');
+const eyeR      = document.getElementById('eye-r');
+const pupilL    = document.getElementById('pupil-l');
+const pupilR    = document.getElementById('pupil-r');
+const mouth     = document.getElementById('mouth');
+const blushL    = document.getElementById('blush-l');
+const blushR    = document.getElementById('blush-r');
+const spark     = document.getElementById('spark');
+const stateLabel = document.getElementById('state-label');
+
+function setFace(state) {
+  // reset
+  blushL.setAttribute('opacity', '0');
+  blushR.setAttribute('opacity', '0');
+  spark.setAttribute('opacity', '0');
+  eyeL.setAttribute('ry', '8');
+  eyeR.setAttribute('ry', '8');
+  mouth.setAttribute('d', 'M 54 90 Q 70 100 86 90');
+  stateLabel.style.color = 'var(--muted)';
+
+  if (state === 'happy') {
+    mouth.setAttribute('d', 'M 50 88 Q 70 105 90 88');
+    blushL.setAttribute('opacity', '0.6');
+    blushR.setAttribute('opacity', '0.6');
+    stateLabel.textContent = 'i know that!';
+    stateLabel.style.color = 'var(--happy)';
+
+  } else if (state === 'curious') {
+    mouth.setAttribute('d', 'M 56 92 Q 70 96 84 92');
+    spark.setAttribute('opacity', '1');
+    eyeL.setAttribute('ry', '9');
+    eyeR.setAttribute('ry', '9');
+    stateLabel.textContent = 'hmm… exploring';
+    stateLabel.style.color = 'var(--curious)';
+
+  } else if (state === 'confused') {
+    mouth.setAttribute('d', 'M 56 95 Q 70 88 84 95');
+    eyeL.setAttribute('ry', '6');
+    eyeR.setAttribute('ry', '6');
+    stateLabel.textContent = "i don't know this yet";
+    stateLabel.style.color = 'var(--soft)';
+
+  } else if (state === 'listening') {
+    mouth.setAttribute('d', 'M 54 90 Q 70 100 86 90');
+    stateLabel.textContent = 'listening…';
+    stateLabel.style.color = 'var(--calm)';
+
+  } else if (state === 'name') {
+    mouth.setAttribute('d', 'M 48 87 Q 70 108 92 87');
+    blushL.setAttribute('opacity', '0.8');
+    blushR.setAttribute('opacity', '0.8');
+    eyeL.setAttribute('ry', '9');
+    eyeR.setAttribute('ry', '9');
+    stateLabel.textContent = 'that\'s me! 🌟';
+    stateLabel.style.color = 'var(--accent)';
+
+  } else {
+    stateLabel.textContent = 'listening';
+    stateLabel.style.color = 'var(--muted)';
+  }
+}
+
+// blink loop
+function blink() {
+  eyeL.setAttribute('ry', '1');
+  eyeR.setAttribute('ry', '1');
+  setTimeout(() => {
+    eyeL.setAttribute('ry', '8');
+    eyeR.setAttribute('ry', '8');
+  }, 120);
+  setTimeout(blink, 2800 + Math.random() * 2000);
+}
+blink();
+
+// ── Messages ───────────────────────────────────────────────────
+const convo = document.getElementById('convo');
+
+function addMsg(who, text, meta='') {
+  const div = document.createElement('div');
+  div.className = `msg ${who}`;
+  div.innerHTML = `
+    <div class="bubble">${text}</div>
+    ${meta ? `<div class="msg-meta">${meta}</div>` : ''}
+  `;
+  convo.appendChild(div);
+  convo.scrollTop = convo.scrollHeight;
+}
+
+// ── Score bar ──────────────────────────────────────────────────
+const fill = document.getElementById('score-fill');
+
+function setScore(confidence) {
+  const pct = Math.min(100, Math.round(confidence * 100));
+  fill.style.width    = pct + '%';
+  fill.style.background = pct > 60 ? 'var(--happy)'
+                        : pct > 30 ? 'var(--curious)'
+                        : 'var(--soft)';
+}
+
+// ── Graph numbers ──────────────────────────────────────────────
+function updateGraph(nodes, edges, l1) {
+  document.getElementById('g-nodes').textContent = nodes ?? '—';
+  document.getElementById('g-edges').textContent = edges ?? '—';
+  document.getElementById('g-l1').textContent    = l1    ?? '—';
+}
+
+// ── Send to server ─────────────────────────────────────────────
+async function sendInput(text) {
+  if (!text.trim()) return;
+  lastInput = text.trim().toLowerCase();
+
+  addMsg('you', text);
+  setFace('listening');
+
+  try {
+    const res  = await fetch(`${API}/speak`, {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({ text: lastInput }),
+    });
+    const data = await res.json();
+
+    updateGraph(data.nodes, data.edges, data.level1);
+    setScore(data.confidence ?? 0);
+
+    // Determine face state
+    const conf = data.confidence ?? 0;
+    const word = data.response_word ?? '';
+    let   faceState = 'confused';
+
+    if (lastInput.includes('deepak') || lastInput === 'little deepak') {
+      faceState = 'name';
+    } else if (conf > 0.6) {
+      faceState = 'happy';
+    } else if (data.tinkerer_active) {
+      faceState = 'curious';
+    } else if (conf > 0.2) {
+      faceState = 'listening';
+    }
+
+    setFace(faceState);
+
+    // Response
+    let responseText = '';
+    if (conf > 0.3 && word) {
+      responseText = word;
+    } else if (data.tinkerer_active) {
+      responseText = '…';
+    } else {
+      responseText = '?';
+    }
+
+    const meta = `confidence ${Math.round((conf) * 100)}%  ·  score ${
+      data.score ? data.score.toExponential(1) : '0'
+    }`;
+
+    setTimeout(() => {
+      addMsg('deepak', responseText, meta);
+      if (responseText !== '?' && responseText !== '…') {
+        speak(responseText);
+      }
+      // return to neutral after a moment
+      setTimeout(() => setFace('listening'), 3000);
+    }, 300);
+
+  } catch (e) {
+    addMsg('deepak', '— brain offline —', 'check python server.py is running');
+    stateLabel.textContent = 'disconnected';
+  }
+}
+
+// ── Teach ──────────────────────────────────────────────────────
+async function teachInput(text) {
+  if (!text.trim()) return;
+
+  try {
+    const res  = await fetch(`${API}/teach`, {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({ text: text.trim().toLowerCase(), reward: true }),
+    });
+    const data = await res.json();
+    updateGraph(data.nodes, data.edges, null);
+    addMsg('deepak', `✓ learning "${text}"`, `intensity ${
+      data.intensity ? data.intensity.toExponential(1) : '—'
+    }`);
+    setFace('curious');
+    setTimeout(() => setFace('listening'), 2000);
+  } catch (e) {
+    addMsg('deepak', '— brain offline —');
+  }
+}
+
+// ── Server status ──────────────────────────────────────────────
+async function checkServer() {
+  try {
+    const res  = await fetch(`${API}/state`);
+    const data = await res.json();
+    document.getElementById('server-status').textContent =
+      `${data.nodes} nodes · ${data.edges} edges · ${data.known_words.length} known words`;
+    updateGraph(data.nodes, data.edges, data.level1 ?? null);
+    setFace('listening');
+  } catch (e) {
+    document.getElementById('server-status').textContent =
+      'brain offline — run: python server.py';
+    setFace('confused');
+  }
+}
+
+checkServer();
+setInterval(checkServer, 10000);
+
+// ── Event listeners ────────────────────────────────────────────
+const input    = document.getElementById('text-input');
+const sendBtn  = document.getElementById('send-btn');
+const micBtn   = document.getElementById('mic-btn');
+const teachBtn = document.getElementById('teach-btn');
+
+sendBtn.addEventListener('click', () => {
+  sendInput(input.value);
+  input.value = '';
+});
+
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    sendInput(input.value);
+    input.value = '';
+  }
+});
+
+teachBtn.addEventListener('click', () => {
+  if (input.value.trim()) {
+    teachInput(input.value.trim());
+    input.value = '';
+  } else if (lastInput) {
+    teachInput(lastInput);
+  }
+});
+
+// ── Microphone ─────────────────────────────────────────────────
+if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SR();
+  recognition.lang = 'en-IN';
+  recognition.continuous = false;
+  recognition.interimResults = false;
+
+  recognition.onresult = e => {
+    const text = e.results[0][0].transcript;
+    input.value = text;
+    sendInput(text);
+    input.value = '';
+  };
+
+  recognition.onstart = () => {
+    isListening = true;
+    micBtn.classList.add('active');
+    setFace('listening');
+    stateLabel.textContent = 'hearing you…';
+  };
+
+  recognition.onend = () => {
+    isListening = false;
+    micBtn.classList.remove('active');
+  };
+
+  recognition.onerror = () => {
+    isListening = false;
+    micBtn.classList.remove('active');
+  };
+
+  micBtn.addEventListener('click', () => {
+    if (isListening) {
+      recognition.stop();
+    } else {
+      recognition.start();
+    }
+  });
+} else {
+  micBtn.title = 'speech not supported in this browser';
+  micBtn.style.opacity = '0.3';
+}
+</script>
+</body>
+</html>

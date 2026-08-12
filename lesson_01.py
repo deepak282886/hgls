@@ -48,7 +48,7 @@ def teach(s: System, reps: int = 20) -> None:
 
     print('\n[Teaching: little deepak]')
     for rep in range(reps):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('little deepak',
             text_atoms  = NAME_TEXT,
             voice_atoms = NAME_VOICE,
             reward      = True,
@@ -60,7 +60,7 @@ def teach(s: System, reps: int = 20) -> None:
 
     print('\n[Teaching: papa]')
     for rep in range(reps):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('papa',
             text_atoms  = PAPA_TEXT,
             voice_atoms = PAPA_VOICE_ATOMS,
             reward      = True,
@@ -68,6 +68,10 @@ def teach(s: System, reps: int = 20) -> None:
         if (rep + 1) % 5 == 0:
             print(f"  rep {rep+1:2d}  cross={cross:.4f}  avg_intensity={avg:.2f}")
 
+
+    # Register concepts in the graph
+    s.register_concept('little deepak')
+    s.register_concept('papa')
     s.save()
 
 

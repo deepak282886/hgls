@@ -45,7 +45,7 @@ def teach(s: System) -> None:
 
     print('\n[Phase 1] Word alone — text + voice, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('cup',
             text_atoms  = CUP_TEXT,
             voice_atoms = CUP_VOICE,
             reward      = True,
@@ -57,7 +57,7 @@ def teach(s: System) -> None:
 
     print('\n[Phase 2] Word + sight — all three, 15 reps')
     for rep in range(15):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('cup',
             text_atoms   = CUP_TEXT,
             voice_atoms  = CUP_VOICE,
             vision_atoms = CUP_PATCHES_WARM,
@@ -71,7 +71,7 @@ def teach(s: System) -> None:
     print('\n[Phase 3] Consolidation — warm + cool cup, 15 reps')
     for rep in range(15):
         patches = CUP_PATCHES_WARM if rep % 2 == 0 else CUP_PATCHES_COOL
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('cup',
             text_atoms   = CUP_TEXT,
             voice_atoms  = CUP_VOICE,
             vision_atoms = patches,
@@ -80,6 +80,9 @@ def teach(s: System) -> None:
         if (rep + 1) % 5 == 0:
             print(f"  rep {rep+1:2d}  cross={cross:.4f}  avg={avg:.0f}")
 
+
+    # Register concepts in the graph
+    s.register_concept('cup')
     s.save()
 
 

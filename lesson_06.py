@@ -63,7 +63,7 @@ def teach(s: System) -> None:
     print('\n[Part A] Cup — mama\'s voice, 10 reps')
     for rep in range(10):
         voice   = CUP_VOICE_MAMA if rep % 2 == 0 else CUP_VOICE_PAPA
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('cup',
             text_atoms   = CUP_TEXT,
             voice_atoms  = voice,
             vision_atoms = CUP_PATCHES,
@@ -76,7 +76,7 @@ def teach(s: System) -> None:
     for phrase in [DRINK_CUP, YOUR_CUP, MAMAS_CUP]:
         for rep in range(5):
             voice = CUP_VOICE_MAMA if rep % 2 == 0 else CUP_VOICE_PAPA
-            s.learn_multi(
+            s.teach_concept(s.text_from_atoms(phrase),
                 text_atoms   = phrase,
                 voice_atoms  = voice,
                 vision_atoms = CUP_PATCHES,
@@ -89,7 +89,7 @@ def teach(s: System) -> None:
     # ── Part B: Spoon core ────────────────────────────────────────
     print('\n[Part B] Spoon — word alone, 10 reps')
     for rep in range(10):
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('spoon',
             text_atoms  = SPOON_TEXT,
             voice_atoms = SPOON_VOICE,
             reward      = True,
@@ -100,7 +100,7 @@ def teach(s: System) -> None:
     print('\n[Part B] Spoon — word + sight, 15 reps')
     for rep in range(15):
         patches = SPOON_PATCHES if rep % 2 == 0 else SPOON_PATCHES_SIDE
-        paths, cross, avg = s.learn_multi(
+        paths, cross, avg = s.teach_concept('spoon',
             text_atoms   = SPOON_TEXT,
             voice_atoms  = SPOON_VOICE,
             vision_atoms = patches,
@@ -109,6 +109,13 @@ def teach(s: System) -> None:
         if (rep + 1) % 5 == 0:
             print(f"  rep {rep+1:2d}  cross={cross:.4f}  avg={avg:.0f}")
 
+
+    # Register concepts in the graph
+    s.register_concept('cup')
+    s.register_concept('drink from the cup')
+    s.register_concept('your cup')
+    s.register_concept('mamas cup')
+    s.register_concept('spoon')
     s.save()
 
 
