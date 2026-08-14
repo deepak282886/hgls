@@ -755,34 +755,81 @@ class InferenceEngine:
         self, start_id: int
     ) -> tuple[list[int], list[float], set[tuple[int,int]]]:
         """
-        Beam search. Returns (chain, path_weights, active_edges).
+        Beam search with structure preference.
+        Returns (chain, path_weights, active_edges).
         active_edges is the set of edges walked, for reward propagation.
+
+        Structure preference — two mechanisms:
+
+        1. Neighbours are scored by effective_weight = w * (1 + log(1 + level))
+           where level is the destination node's level. This gently lifts
+           structure-to-structure edges over atom-to-atom edges without
+           creating a hard threshold — atoms can still be visited, they
+           just don't dominate once structure-level paths exist.
+
+        2. When expanding from a structure node (level >= 1), structure
+           neighbours are tried before atom neighbours. If any structure
+           neighbours exist, atom neighbours are skipped for that step.
+           This prevents downward-growth edges (structure -> atom) from
+           pulling traversal back down to the atomic level once it has
+           climbed into semantic territory.
         """
+        import math
         g   = self.graph
         cfg = self.cfg
+
+        def effective_weight(dst: int, w: float) -> float:
+            meta = g._nodes.get(dst)
+            level = meta.level if meta else 0
+            return w * (1.0 + math.log(1.0 + level))
 
         beam: list[tuple[float, int, list[int], list[float]]] = [
             (0.0, start_id, [start_id], [])
         ]
-        best_path:    list[int]         = [start_id]
-        best_weights: list[float]       = []
+        best_path:    list[int]           = [start_id]
+        best_weights: list[float]         = []
         all_active:   set[tuple[int,int]] = set()
 
         for _ in range(cfg.max_traversal_depth):
             if not beam:
                 break
             next_beam: list[tuple[float, int, list[int], list[float]]] = []
+
             for neg_w, node, path, pw in beam:
-                nbs = g.neighbors(node)
+                node_meta  = g._nodes.get(node)
+                node_level = node_meta.level if node_meta else 0
+                nbs        = g.neighbors(node)
+
                 if not nbs:
                     if len(path) > len(best_path):
                         best_path, best_weights = path, pw
                     continue
-                for dst, w in nbs[:cfg.beam_width]:
-                    if dst not in path:
-                        # FIX 2 — record every edge walked during traversal
-                        all_active.add((node, dst))
-                        next_beam.append((neg_w - w, dst, path + [dst], pw + [w]))
+
+                # When at a structure node — prefer structure neighbours.
+                # Only fall back to atom neighbours if no structure ones exist.
+                if node_level >= 1:
+                    struct_nbs = [
+                        (dst, w) for dst, w in nbs
+                        if g._nodes.get(dst) and g._nodes[dst].level >= 1
+                        and dst not in path
+                    ]
+                    candidates = struct_nbs if struct_nbs else [
+                        (dst, w) for dst, w in nbs if dst not in path
+                    ]
+                else:
+                    candidates = [(dst, w) for dst, w in nbs if dst not in path]
+
+                # Score by level-weighted effective weight, take top beam_width
+                scored = sorted(
+                    candidates,
+                    key=lambda x: -effective_weight(x[0], x[1])
+                )[:cfg.beam_width]
+
+                for dst, w in scored:
+                    all_active.add((node, dst))
+                    ew = effective_weight(dst, w)
+                    next_beam.append((neg_w - ew, dst, path + [dst], pw + [w]))
+
             if not next_beam:
                 break
             next_beam.sort(key=lambda x: x[0])
