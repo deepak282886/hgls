@@ -21,6 +21,7 @@ env/
 # Memory / saved state
 knowledge.json
 knowledge.json.bak
+checkpoints/
 
 # IDE
 .vscode/
@@ -33,8 +34,3 @@ Thumbs.db
 
 # Logs
 *.log
-
-# Distribution
-dist/
-build/
-*.egg-info/

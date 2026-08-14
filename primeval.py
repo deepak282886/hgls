@@ -73,8 +73,17 @@ class Config:
     # proposed weight for a NEW inter-structure link = surface * this
     # existing links are never touched by the consolidator
     consolidator_proposal_scale: float = 0.01
-    # compute budget: how many most-stable structures to pair per pass
-    consolidator_top_k: int = 200
+    # compute budget — how many co-activated pairs to process per pass.
+    # This is NOT a semantic threshold. Every pair in _counts is a
+    # legitimate candidate. This parameter controls how many we can
+    # afford to process each pass. The most frequently co-activated
+    # pairs go first. The rest are deferred to the next pass.
+    # Nothing is excluded — just queued by frequency.
+    consolidator_budget: int = 500
+    # fractional decay applied to _counts each decay pass.
+    # Stale co-activations fade naturally — pairs no longer witnessed
+    # gradually drop toward zero and stop consuming consolidator budget.
+    counts_decay_rate: float = 0.01
 
     # Decay — asymptotic compression, no floor, no deletion
     decay_interval: int = 200
@@ -386,8 +395,13 @@ class WeightedGraph:
         Float underflow to exactly 0.0 triggers memory cleanup only.
         Higher-level structures decay faster — they compress toward
         the atomic bedrock beneath them.
+
+        Also decays _counts — co-activation counts for pairs no longer
+        witnessed fade naturally. This prevents stale pairs from
+        permanently consuming consolidator budget.
         """
         with self._lock:
+            # ── Edge weight decay ──────────────────────────────────────────────
             to_remove: list[tuple[int,int]] = []
             for key, w in list(self._weights.items()):
                 level = self._nodes[key[0]].level if key[0] in self._nodes else 0
@@ -406,6 +420,21 @@ class WeightedGraph:
                 self._counts.pop(key, None)
                 self._reward.pop(key, None)
                 self._adj.get(key[0], {}).pop(key[1], None)
+
+            # ── Counts decay ───────────────────────────────────────────────────
+            # Co-activation counts decay fractionally each pass.
+            # Pairs no longer witnessed gradually fade and stop consuming
+            # consolidator budget. Integer floor at 0 — never negative.
+            rate = self.cfg.counts_decay_rate
+            stale: list[tuple[int,int]] = []
+            for key, count in list(self._counts.items()):
+                new_count = count * (1.0 - rate)
+                if new_count < 1.0:
+                    stale.append(key)
+                else:
+                    self._counts[key] = new_count
+            for key in stale:
+                del self._counts[key]
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
@@ -505,11 +534,17 @@ class Consolidator:
         cfg = self.cfg
         new = 0
 
-        # Collect all edges between structures (level >= 1).
-        # Each such edge a→b was created during traversal when a and b
-        # co-activated sequentially in the same input.
-        # Sort by co-activation count — most frequent sequential pairs first.
-        coactivated: list[tuple[int, int, int, int]] = []
+        # Collect all co-activated structure pairs from _counts.
+        # Sort by co-activation count descending — most frequently
+        # witnessed sequential pairs get processed first.
+        # Process only up to consolidator_budget pairs per pass.
+        # This is a compute budget, not a semantic threshold —
+        # every pair is a legitimate candidate, the budget just
+        # controls how many we can afford each pass. Pairs not
+        # processed this pass will be picked up next time, ranked
+        # again by their then-current count. Counts decay ensures
+        # stale pairs gradually drop out of contention naturally.
+        coactivated: list[tuple[float, int, int]] = []
         for (a, b), count in list(g._counts.items()):
             meta_a = g._nodes.get(a)
             meta_b = g._nodes.get(b)
@@ -517,17 +552,20 @@ class Consolidator:
                 continue
             if meta_a.level < 1 or meta_b.level < 1:
                 continue   # atom pairs handled by traversal directly
-            coactivated.append((count, meta_a.level, a, b))
+            coactivated.append((count, a, b))
 
+        # Most frequently co-activated pairs first
         coactivated.sort(reverse=True)
 
-        for count, lv_a, a, b in coactivated[:cfg.consolidator_top_k]:
+        for count, a, b in coactivated[:cfg.consolidator_budget]:
+            meta_a   = g._nodes.get(a)
             meta_b   = g._nodes.get(b)
-            lv_b     = meta_b.level if meta_b else 1
+            if meta_a is None or meta_b is None:
+                continue
             surface  = self._surface(a, b)
             if surface <= 0.0:
                 continue
-            new_level  = max(lv_a, lv_b) + 1
+            new_level  = max(meta_a.level, meta_b.level) + 1
             g.get_or_create_structure((a, b), level=new_level)
             proposed_w = surface * cfg.consolidator_proposal_scale
             if g.propose_weight(a, b, proposed_w):
@@ -810,7 +848,13 @@ class Primeval:
         with open(os.path.join(path, "meta.pkl"), "rb") as f:
             meta = pickle.load(f)
         self._step = meta["step"]
-        self.cfg   = meta["config"]
+        # Preserve current checkpoint_dir — do not let the loaded config
+        # overwrite it. Each stage trainer sets its own checkpoint_dir
+        # in cfg before calling load(); restoring the old one would cause
+        # periodic saves to land in the previous stage's directory.
+        current_checkpoint_dir = self.cfg.checkpoint_dir
+        self.cfg = meta["config"]
+        self.cfg.checkpoint_dir = current_checkpoint_dir
         logger.info("Loaded from %s, resuming at step %d", path, self._step)
 
     def stats(self) -> dict:
@@ -861,7 +905,6 @@ if __name__ == "__main__":
         downward_growth_delta=0.1,
         consolidator_interval=50,
         consolidator_proposal_scale=0.01,
-        consolidator_top_k=100,
         decay_interval=100,
         base_decay_rate=1e-3,
         checkpoint_interval=9_999,
