@@ -78,19 +78,20 @@ from nltk.corpus import nps_chat
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate(system: Primeval, prompt: str,
-             max_steps: int = 40,
-             min_weight: float = 0.0) -> str:
+             decay_factor: float = 0.5) -> str:
     """
-    Generate a response by following atom-level edges forward
-    from the last atom of the prompt.
+    Generate by following atom-level edges forward from the last
+    prompt atom, with a per-step dynamic threshold.
 
-    The prompt establishes context — its atoms activate the graph.
-    Generation starts from the last prompt atom and greedily follows
-    the heaviest outgoing letter-atom edges.
+    At each step threshold = current_edge_weight * decay_factor.
+    The next edge must exceed this to continue.
 
-    visited only tracks nodes visited DURING generation to prevent
-    loops — prompt atoms are NOT blocked since answer content often
-    shares letters with the question.
+    Termination happens naturally when the path weakens sharply —
+    which happens after '.' once answer paths are well trained.
+    No visited set. No step limit. No hardcoded stop.
+    The graph earns the stopping point through training volume.
+    Give it all the answers — the traversal paths become dominant
+    and generation follows them cleanly to their natural end.
     """
     system.ingest("letter", prompt)
 
@@ -98,22 +99,30 @@ def generate(system: Primeval, prompt: str,
     if not prompt_atoms:
         return "[no response]"
 
-    current  = prompt_atoms[-1]
-    g        = system.graph
-    chars:   list[str] = []
-    visited: set[int]  = set()   # only generation-time loop prevention
+    current = prompt_atoms[-1]
+    g       = system.graph
+    chars:  list[str] = []
 
-    for _ in range(max_steps):
-        visited.add(current)
+    nbs = [
+        (nb, w) for nb, w in g.neighbors(current)
+        if Atoms.LETTER_OFF <= nb < Atoms.PHONEME_OFF
+    ]
+    if not nbs:
+        return "[no response]"
+
+    current, current_w = nbs[0]
+    chars.append(chr(current - Atoms.LETTER_OFF))
+
+    while True:
+        threshold = current_w * decay_factor
         nbs = [
             (nb, w) for nb, w in g.neighbors(current)
-            if nb not in visited
-            and w > min_weight
-            and Atoms.LETTER_OFF <= nb < Atoms.PHONEME_OFF
+            if Atoms.LETTER_OFF <= nb < Atoms.PHONEME_OFF
+            and w >= threshold
         ]
         if not nbs:
             break
-        current, w = nbs[0]
+        current, current_w = nbs[0]
         chars.append(chr(current - Atoms.LETTER_OFF))
 
     return "".join(chars).strip() if chars else "[no response]"
@@ -223,15 +232,18 @@ def train_pair(system: Primeval,
 
     Returns overlap score (0-1).
     """
+    # Full sequence: question + answer + full stop
+    # The full stop teaches the graph where sequences end.
+    # Over training the graph learns '.' terminates the answer naturally.
     q_atoms = Atoms.sequence("letter", list(question))
-    a_atoms = Atoms.sequence("letter", list(answer))
+    a_atoms = Atoms.sequence("letter", list(" " + answer + "."))
 
-    # Step 1 — answer path first
+    # Step 1 — answer path first (with full stop)
     for _ in range(answer_reps):
         system.ingest_atoms(a_atoms)
         system.reward(reward_scale * 3.0)
 
-    # Step 2 — bridge
+    # Step 2 — bridge: full sequence question + answer + stop
     for _ in range(bridge_reps):
         system.ingest_atoms(q_atoms + a_atoms)
         system.reward(reward_scale * 2.0)
