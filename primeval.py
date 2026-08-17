@@ -373,19 +373,30 @@ class WeightedGraph:
 
     def apply_reward(self, amount: float) -> None:
         """
-        Strengthen all active edges.
-        _active is the union of the last ingestion traversal AND any
-        inference traversal that followed — so reward correctly
-        strengthens whichever path was most recently walked.
+        Strengthen or weaken active edges based on reward sign.
+
+        Positive reward — thickens active edges. Correct paths earn weight.
+        Negative reward — thins active edges, floor at zero. Wrong paths
+        lose weight and stop competing with correct ones over time.
+
+        The magnitude of change is proportional to the reward amount,
+        so strong corrections have strong effects and weak signals
+        have proportionally smaller effects. Correct paths accumulate
+        weight faster than wrong paths lose it — ensuring the correct
+        signal dominates without completely erasing exploration paths.
         """
         delta = amount * self.cfg.reward_multiplier
         with self._lock:
             for key in self._active:
                 if key in self._weights:
-                    self._weights[key] += delta
-                    self._adj[key[0]][key[1]] = self._weights[key]
-                    self._in_weight[key[1]] += delta
-                    self._reward[key] = self._reward.get(key, 0.0) + amount
+                    current = self._weights[key]
+                    new_w   = max(0.0, current + delta)
+                    diff    = new_w - current
+                    self._weights[key]          = new_w
+                    self._adj[key[0]][key[1]]   = new_w
+                    self._in_weight[key[1]]     += diff
+                    if amount > 0:
+                        self._reward[key] = self._reward.get(key, 0.0) + amount
 
     # ── Decay ─────────────────────────────────────────────────────────────────
 
@@ -755,33 +766,19 @@ class InferenceEngine:
         self, start_id: int
     ) -> tuple[list[int], list[float], set[tuple[int,int]]]:
         """
-        Beam search with structure preference.
-        Returns (chain, path_weights, active_edges).
-        active_edges is the set of edges walked, for reward propagation.
+        Beam search — pure weight-based. No structural preference imposed.
 
-        Structure preference — two mechanisms:
+        Traversal follows the heaviest edges, whatever they connect.
+        If semantic structure-to-structure paths are heavier than atom
+        paths, the chain will follow them naturally. If not yet, it won't.
+        The graph earns the behaviour through training, not architecture.
 
-        1. Neighbours are scored by effective_weight = w * (1 + log(1 + level))
-           where level is the destination node's level. This gently lifts
-           structure-to-structure edges over atom-to-atom edges without
-           creating a hard threshold — atoms can still be visited, they
-           just don't dominate once structure-level paths exist.
-
-        2. When expanding from a structure node (level >= 1), structure
-           neighbours are tried before atom neighbours. If any structure
-           neighbours exist, atom neighbours are skipped for that step.
-           This prevents downward-growth edges (structure -> atom) from
-           pulling traversal back down to the atomic level once it has
-           climbed into semantic territory.
+        Any behaviour we want — structure preference, semantic coherence,
+        causal reasoning — can be taught by rewarding the right chains.
+        The reward signal is the teacher. The graph is the student.
         """
-        import math
         g   = self.graph
         cfg = self.cfg
-
-        def effective_weight(dst: int, w: float) -> float:
-            meta = g._nodes.get(dst)
-            level = meta.level if meta else 0
-            return w * (1.0 + math.log(1.0 + level))
 
         beam: list[tuple[float, int, list[int], list[float]]] = [
             (0.0, start_id, [start_id], [])
@@ -794,42 +791,16 @@ class InferenceEngine:
             if not beam:
                 break
             next_beam: list[tuple[float, int, list[int], list[float]]] = []
-
             for neg_w, node, path, pw in beam:
-                node_meta  = g._nodes.get(node)
-                node_level = node_meta.level if node_meta else 0
-                nbs        = g.neighbors(node)
-
+                nbs = g.neighbors(node)
                 if not nbs:
                     if len(path) > len(best_path):
                         best_path, best_weights = path, pw
                     continue
-
-                # When at a structure node — prefer structure neighbours.
-                # Only fall back to atom neighbours if no structure ones exist.
-                if node_level >= 1:
-                    struct_nbs = [
-                        (dst, w) for dst, w in nbs
-                        if g._nodes.get(dst) and g._nodes[dst].level >= 1
-                        and dst not in path
-                    ]
-                    candidates = struct_nbs if struct_nbs else [
-                        (dst, w) for dst, w in nbs if dst not in path
-                    ]
-                else:
-                    candidates = [(dst, w) for dst, w in nbs if dst not in path]
-
-                # Score by level-weighted effective weight, take top beam_width
-                scored = sorted(
-                    candidates,
-                    key=lambda x: -effective_weight(x[0], x[1])
-                )[:cfg.beam_width]
-
-                for dst, w in scored:
-                    all_active.add((node, dst))
-                    ew = effective_weight(dst, w)
-                    next_beam.append((neg_w - ew, dst, path + [dst], pw + [w]))
-
+                for dst, w in nbs[:cfg.beam_width]:
+                    if dst not in path:
+                        all_active.add((node, dst))
+                        next_beam.append((neg_w - w, dst, path + [dst], pw + [w]))
             if not next_beam:
                 break
             next_beam.sort(key=lambda x: x[0])
@@ -883,6 +854,74 @@ class Primeval:
 
     def infer_mixed(self, pairs) -> InferenceResult:
         return self.inference.run(Atoms.mixed(*pairs))
+
+    def decode(self, node_ids: list[int]) -> str:
+        """
+        Decode a list of node IDs (atoms or structures) to text.
+        Letter atoms emit their character directly.
+        Structure nodes emit the characters of their constituent atoms,
+        recursed until atoms are reached.
+        Simple consecutive-duplicate suppression keeps output readable.
+        """
+        chars:    list[str] = []
+        last_ch:  str       = ""
+
+        def emit(nid: int, depth: int = 0) -> None:
+            nonlocal last_ch
+            if depth > 10:
+                return
+            meta = self.graph._nodes.get(nid)
+            if meta is None:
+                return
+            if meta.level == 0:
+                if Atoms.LETTER_OFF <= nid < Atoms.PHONEME_OFF:
+                    ch = chr(nid - Atoms.LETTER_OFF)
+                    if ch != last_ch:   # suppress consecutive duplicates only
+                        chars.append(ch)
+                        last_ch = ch
+                return
+            for constituent in meta.constituents:
+                emit(constituent, depth + 1)
+
+        for nid in node_ids:
+            emit(nid)
+
+        return "".join(chars)
+
+    def _decompose(self, node_id: int, visited: set) -> list[int]:
+        """
+        Recursively decompose a node down to its constituent atoms.
+        Returns atom IDs in constituent order.
+        Visited set prevents revisiting the same node.
+        Atoms (level 0) are returned directly.
+        """
+        if node_id in visited:
+            return []
+        visited.add(node_id)
+        meta = self.graph._nodes.get(node_id)
+        if meta is None:
+            return []
+        if meta.level == 0:
+            return [node_id]
+        atoms: list[int] = []
+        for constituent in meta.constituents:
+            atoms.extend(self._decompose(constituent, visited))
+        return atoms
+
+    def respond(self, prompt: str, max_chain: int = 10) -> str:
+        """
+        Generate a response by traversing forward from the prompt anchor
+        and decoding whatever letter atoms the chain visits.
+
+        Nothing more. The chain IS the response.
+        If it's wrong, correct it externally via negative reward on the
+        bad path and strong positive reward on the correct path.
+        Over training the correct paths become heavier and the traversal
+        reaches them naturally. No hardcoding. No structural tricks.
+        The graph earns the right response through reward.
+        """
+        result = self.inference.run(Atoms.sequence("letter", list(prompt)))
+        return self.decode(result.chain)
 
     def save(self, path: str) -> None:
         self.graph.save(path)
