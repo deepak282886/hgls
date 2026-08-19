@@ -289,8 +289,12 @@ class GenerationEngine:
 # Convenience builder for the complete stack
 # ─────────────────────────────────────────────
 
-def build_system(dim: int = 32, merge_threshold: float = 2.0) -> dict:
-    """Build and return the complete system."""
+def build_system(dim: int = 24, merge_threshold: float = 1.2) -> dict:
+    """
+    Build and return the complete system.
+    lean=True  — LeanAbsorber: fast, words+sentences, periodic merge. Use for corpora.
+    lean=False — full Absorber: all levels, merge on every absorb. Use for small inputs.
+    """
     space = GeometricSpace(dim=dim, merge_threshold=merge_threshold, pull_rate=0.1)
     reward_graph = RewardGraph()
     merge_engine = MergeEngine(space=space, dim=dim)
