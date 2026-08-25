@@ -425,6 +425,94 @@ def activate_from_node(
     )
 
 
+# ─────────────────────────────────────────────
+# ACTIVATE FROM PATH
+# Multi-seed activation from a phase-1 understanding path
+# ─────────────────────────────────────────────
+
+def activate_from_path(
+    path       : list[int],
+    graph      : Graph,
+    max_hops   : int   = MAX_HOPS + 2,   # broader than single-node spread
+    threshold  : float = ACTIVATION_THRESHOLD,
+    max_nodes  : int   = MAX_LIT_NODES,
+) -> ActivationResult:
+    """
+    Activate from a list of node IDs representing a phase-1
+    understanding path.
+
+    Every node in the path is a seed. Initial activation is
+    weighted by two factors combined:
+        - Position in path: later nodes (closer to where
+          comprehension landed) seed stronger than earlier ones.
+        - Node reward: higher-reward nodes in the path
+          seed stronger than low-reward ones.
+
+    This produces a subgraph shaped by the understanding —
+    the generation space is not the raw query neighbourhood
+    but the neighbourhood of what the system already determined
+    is relevant.
+
+    max_hops is intentionally larger than single-node spread
+    because the generation subgraph should be broader than
+    the understanding subgraph — the answer may live further
+    out from the comprehension endpoint than the query did.
+    """
+    if not path:
+        return ActivationResult(lit={}, seeds=[], query=None, level=None)
+
+    # Collect valid nodes from path
+    path_nodes = []
+    for nid in path:
+        node = graph.get_node(nid)
+        if node is not None:
+            path_nodes.append((nid, node))
+
+    if not path_nodes:
+        return ActivationResult(lit={}, seeds=[], query=None, level=None)
+
+    n = len(path_nodes)
+
+    # Compute initial activation weights per seed
+    # Position weight: linear ramp from 0.3 (start) to 1.0 (end)
+    # Reward weight: map raw reward to [0.1, 1.0] via sigmoid
+    initial: dict[int, float] = {}
+    for i, (nid, node) in enumerate(path_nodes):
+        position_weight = 0.3 + 0.7 * (i / max(1, n - 1))
+        reward_weight   = 0.1 + 0.9 * (
+            1.0 / (1.0 + np.exp(-node.reward / ACTIVATION_TEMPERATURE))
+        )
+        initial[nid] = position_weight * reward_weight
+
+    # Normalise initial weights to [0, 1]
+    max_init = max(initial.values())
+    if max_init > 1e-9:
+        initial = {k: v / max_init for k, v in initial.items()}
+
+    seed_ids = [nid for nid, _ in path_nodes]
+
+    full_acts = edge_spread(
+        seeds               = seed_ids,
+        graph               = graph,
+        max_hops            = max_hops,
+        threshold           = threshold,
+        initial_activations = initial,
+    )
+
+    norm_acts = normalize_activation(full_acts, max_nodes=max_nodes)
+
+    # Use the last node's embedding as the query embedding —
+    # it represents where comprehension ended
+    last_node = path_nodes[-1][1]
+
+    return ActivationResult(
+        lit   = norm_acts,
+        seeds = seed_ids,
+        query = last_node.embedding,
+        level = last_node.level,
+    )
+
+
 if __name__ == "__main__":
     import tempfile, os
 

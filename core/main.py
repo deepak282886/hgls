@@ -35,8 +35,8 @@ from core.atoms      import Level
 from core.graph      import Graph
 from core.normalizer import Normalizer
 from core.bellman    import BellmanManager
-from core.ingestion  import IngestionConfig, ingest, ingest_text
-from core.traversal  import traverse, traverse_from_node, replay
+from core.ingestion  import IngestionConfig, ingest, ingest_text, ingest_distillation_batch
+from core.traversal  import traverse, traverse_from_node, traverse_two_phase, replay
 from core.activation import activate, activate_from_node
 
 
@@ -155,7 +155,7 @@ def cmd_ingest(args):
 # ─────────────────────────────────────────────
 
 def cmd_query(args):
-    """Activate + traverse from a text query."""
+    """Activate + two-phase traverse from a text query."""
     graph, norm, bm = init_system(args.db, args.norm)
 
     level = parse_level(args.level)
@@ -172,8 +172,7 @@ def cmd_query(args):
     print(f"Level:  {level.name}")
     print(f"Graph:  {gs['node_count']} nodes, {gs['edge_count']} edges\n")
 
-    t0     = time.time()
-    result = traverse(
+    result = traverse_two_phase(
         query      = query,
         graph      = graph,
         normalizer = norm,
@@ -183,36 +182,65 @@ def cmd_query(args):
         max_iter   = args.max_iter,
         max_hops   = args.max_hops,
     )
-    elapsed = time.time() - t0
 
-    if not result.path:
+    u = result.understanding
+    g = result.generation
+
+    if not u.path:
         print("No path found. Query did not activate any nodes.")
         print("Try a different query or ingest more data.")
         shutdown_system(graph, norm, args.norm)
         return
 
-    print(f"Found path: {len(result.path)} nodes  "
-          f"reward={result.total_reward:.3f}  "
-          f"elapsed={elapsed:.4f}s\n")
-
+    # ── Phase 1: Understanding ───────────────
+    print(f"── Understanding  "
+          f"steps={len(u.path)}  "
+          f"reward={u.total_reward:.3f}  "
+          f"elapsed={u.elapsed:.4f}s")
     print("─" * 60)
-    for i, (nid, text) in enumerate(zip(result.path, result.texts)):
+    for i, (nid, text) in enumerate(zip(u.path, u.texts)):
         node = graph.get_node(nid)
         v    = node.V if node else 0.0
         print(f"[{i:02d}] id={nid}  V={v:+.3f}")
         print(f"     {text}\n")
     print("─" * 60)
 
-    if args.mode == "mcts" and result.mcts_result:
-        mr = result.mcts_result
-        print(f"\nMCTS: {mr.iterations} iterations  "
+    if args.mode == "mcts" and u.mcts_result:
+        mr = u.mcts_result
+        print(f"MCTS: {mr.iterations} iter  "
               f"depth={mr.depth}  "
               f"committed_early={mr.committed_early}  "
               f"confidence={mr.confidence:.3f}")
 
-    if args.chain:
-        print(f"\nFull text chain:\n")
-        print(result.text_chain(separator="\n\n"))
+    # ── Phase 2: Generation ──────────────────
+    print(f"\n── Generation  "
+          f"steps={len(g.path)}  "
+          f"reward={g.total_reward:.3f}  "
+          f"elapsed={g.elapsed:.4f}s")
+
+    if not g.path:
+        print("  No generation path found.")
+    else:
+        print("─" * 60)
+        for i, (nid, text) in enumerate(zip(g.path, g.texts)):
+            node = graph.get_node(nid)
+            v    = node.V if node else 0.0
+            print(f"[{i:02d}] id={nid}  V={v:+.3f}")
+            print(f"     {text}\n")
+        print("─" * 60)
+
+        if args.mode == "mcts" and g.mcts_result:
+            mr = g.mcts_result
+            print(f"MCTS: {mr.iterations} iter  "
+                  f"depth={mr.depth}  "
+                  f"committed_early={mr.committed_early}  "
+                  f"confidence={mr.confidence:.3f}")
+
+    print(f"\nTotal elapsed: {result.total_elapsed:.4f}s")
+
+    if args.chain and g.path:
+        print(f"\nGeneration text chain:\n")
+        print(g.text_chain(separator="\n\n"))
 
     shutdown_system(graph, norm, args.norm)
     return result
@@ -435,7 +463,7 @@ def cmd_repl(args):
                 print("  Graph is empty. Use :ingest <path> to load data.")
                 continue
 
-            result = traverse(
+            result = traverse_two_phase(
                 query      = line,
                 graph      = graph,
                 normalizer = norm,
@@ -445,7 +473,7 @@ def cmd_repl(args):
                 max_iter   = args.max_iter,
                 max_hops   = args.max_hops,
             )
-            _print_result(result, graph)
+            _print_two_phase_result(result, graph)
 
     shutdown_system(graph, norm, args.norm)
 
@@ -466,7 +494,6 @@ def _print_result(result, graph):
         v    = node.V if node else 0.0
         lvl  = node.level.name[:4] if node else "????"
         print(f"  [{i:02d}] {lvl}  id={nid}  V={v:+.3f}")
-        # Wrap text at 70 chars
         words = text.split()
         line  = "       "
         for w in words:
@@ -477,6 +504,180 @@ def _print_result(result, graph):
         if line.strip():
             print(line)
         print()
+
+
+def _print_two_phase_result(result, graph):
+    """Print a TwoPhaseResult in REPL format."""
+    u = result.understanding
+    g = result.generation
+
+    if not u.path:
+        print("  No path found.")
+        return
+
+    print(f"\n  ── Understanding ({u.mode})  "
+          f"steps={len(u.path)}  "
+          f"reward={u.total_reward:.3f}  "
+          f"elapsed={u.elapsed:.4f}s\n")
+    for i, (nid, text) in enumerate(zip(u.path, u.texts)):
+        node = graph.get_node(nid)
+        v    = node.V if node else 0.0
+        lvl  = node.level.name[:4] if node else "????"
+        print(f"  [{i:02d}] {lvl}  id={nid}  V={v:+.3f}")
+        words = text.split()
+        line  = "       "
+        for w in words:
+            if len(line) + len(w) > 70:
+                print(line)
+                line = "       "
+            line += w + " "
+        if line.strip():
+            print(line)
+        print()
+
+    print(f"  ── Generation ({g.mode})  "
+          f"steps={len(g.path)}  "
+          f"reward={g.total_reward:.3f}  "
+          f"elapsed={g.elapsed:.4f}s\n")
+    if not g.path:
+        print("  No generation path found.")
+    else:
+        for i, (nid, text) in enumerate(zip(g.path, g.texts)):
+            node = graph.get_node(nid)
+            v    = node.V if node else 0.0
+            lvl  = node.level.name[:4] if node else "????"
+            print(f"  [{i:02d}] {lvl}  id={nid}  V={v:+.3f}")
+            words = text.split()
+            line  = "       "
+            for w in words:
+                if len(line) + len(w) > 70:
+                    print(line)
+                    line = "       "
+                line += w + " "
+            if line.strip():
+                print(line)
+            print()
+
+    print(f"  Total elapsed: {result.total_elapsed:.4f}s")
+
+
+# ─────────────────────────────────────────────
+# COMMAND: COLLIDE
+# ─────────────────────────────────────────────
+
+def cmd_collide(args):
+    """Run the continuous collision loop."""
+    from core.collision import run_collision_loop
+
+    graph, norm, bm = init_system(args.db, args.norm)
+
+    gs = graph.stats()
+    if gs["node_count"] == 0:
+        print("Graph is empty. Run 'ingest' first.")
+        shutdown_system(graph, norm, args.norm)
+        return
+
+    try:
+        stats = run_collision_loop(
+            graph             = graph,
+            normalizer        = norm,
+            bm                = bm,
+            commandments_path = args.commandments,
+            max_iter          = args.max_iter,
+            verbose           = True,
+        )
+    finally:
+        shutdown_system(graph, norm, args.norm)
+
+    return stats
+
+
+# ─────────────────────────────────────────────
+# COMMAND: DISTILL
+# ─────────────────────────────────────────────
+
+def cmd_distill(args):
+    """
+    Run the distillation pipeline — generate from a 7B model
+    and ingest outputs into the graph.
+
+    Expects distill.py to be present. Passes all args through
+    to the Distiller class which handles model loading, prompt
+    generation, reward scoring, and ingestion routing.
+    """
+    try:
+        from core.distill import Distiller, DistillConfig
+    except ImportError:
+        print("distill.py not found. Create core/distill.py first.")
+        return
+
+    graph, norm, bm = init_system(args.db, args.norm)
+
+    config = DistillConfig(
+        model_name      = args.model,
+        prompts_path    = args.prompts,
+        reward_threshold= args.threshold,
+        batch_size      = args.batch_size,
+        max_new_tokens  = args.max_tokens,
+        verbose         = True,
+    )
+
+    level = parse_level(args.level)
+
+    ingest_config = IngestionConfig(
+        max_level  = level,
+        verbose    = False,
+        batch_size = args.batch_size,
+    )
+
+    print(f"\nDistillation pipeline")
+    print(f"  Model:     {args.model}")
+    print(f"  Prompts:   {args.prompts}")
+    print(f"  Threshold: {args.threshold}  "
+          f"(above → positive, below → contrastive)")
+    print(f"  Level:     {level.name}\n")
+
+    distiller = Distiller(config)
+
+    total_pos = 0
+    total_neg = 0
+    batch_num = 0
+
+    try:
+        for positive_texts, negative_texts in distiller.generate_batches():
+            batch_num += 1
+            pos_stats, neg_stats = ingest_distillation_batch(
+                positive_texts = positive_texts,
+                negative_texts = negative_texts,
+                graph          = graph,
+                normalizer     = norm,
+                bm             = bm,
+                config         = ingest_config,
+                verbose        = args.verbose,
+            )
+            total_pos += pos_stats.nodes_created
+            total_neg += neg_stats.nodes_created
+
+            gs = graph.stats()
+            print(f"  Batch {batch_num:4d}  "
+                  f"+{pos_stats.nodes_created} pos  "
+                  f"+{neg_stats.nodes_created} neg  "
+                  f"graph={gs['node_count']} nodes")
+
+            save_normalizer(norm, args.norm)
+
+    except KeyboardInterrupt:
+        print("\nDistillation interrupted.")
+
+    print(f"\nDistillation complete.")
+    print(f"  Total positive nodes: {total_pos}")
+    print(f"  Total contrastive nodes: {total_neg}")
+
+    gs = graph.stats()
+    print(f"  Final graph: {gs['node_count']} nodes, "
+          f"{gs['edge_count']} edges")
+
+    shutdown_system(graph, norm, args.norm)
 
 
 # ─────────────────────────────────────────────
@@ -535,6 +736,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_trav.add_argument("--max-iter", type=int, default=100)
     p_trav.add_argument("--max-hops", type=int, default=6)
 
+    # ── collide ─────────────────────────────
+    p_collide = sub.add_parser("collide", help="Run continuous collision loop")
+    p_collide.add_argument("--max-iter",      type=int, default=0,
+                           help="Stop after N iterations (0=forever)")
+    p_collide.add_argument("--commandments",  default=None,
+                           help="Path to commandments JSON file")
+
+    # ── distill ─────────────────────────────
+    p_distill = sub.add_parser("distill", help="Distill a 7B model into the graph")
+    p_distill.add_argument("--model",      default="mistralai/Mistral-7B-Instruct-v0.2",
+                           help="HuggingFace model name or local path")
+    p_distill.add_argument("--prompts",    required=True,
+                           help="Path to JSONL file of prompts to generate from")
+    p_distill.add_argument("--threshold",  type=float, default=0.0,
+                           help="Reward threshold: above → positive, below → contrastive "
+                                "(default: 0.0)")
+    p_distill.add_argument("--batch-size", type=int, default=32,
+                           help="Prompts per batch (default: 32)")
+    p_distill.add_argument("--max-tokens", type=int, default=256,
+                           help="Max new tokens per completion (default: 256)")
+    p_distill.add_argument("--level",      default="sentence",
+                           help="Ingestion level (default: sentence)")
+    p_distill.add_argument("--verbose",    action="store_true",
+                           help="Verbose ingestion output")
+
     # ── stats ───────────────────────────────
     sub.add_parser("stats", help="Show graph statistics")
 
@@ -565,6 +791,8 @@ def main():
         "ingest"  : cmd_ingest,
         "query"   : cmd_query,
         "traverse": cmd_traverse,
+        "collide" : cmd_collide,
+        "distill" : cmd_distill,
         "stats"   : cmd_stats,
         "sweep"   : cmd_sweep,
         "repl"    : cmd_repl,

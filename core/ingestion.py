@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 
 from core.atoms      import Level, decompose, text_to_paragraphs, text_to_sentences
 from core.graph      import Graph
+from core.edge       import EdgeType
 from core.normalizer import Normalizer
 from core.bellman    import BellmanManager
 from core.reward     import node_reward as compute_node_reward
@@ -624,6 +625,180 @@ def ingest_text(
     bm.sweep(verbose=False)
     stats.elapsed_sec = time.time() - t0
     return stats
+
+
+# ─────────────────────────────────────────────
+# CONTRASTIVE INGESTION
+# For low-reward 7B outputs — nodes enter the graph
+# but transitions between them are marked CONTRASTIVE
+# (negative reward). This teaches the graph what NOT
+# to follow rather than what to follow.
+# ─────────────────────────────────────────────
+
+def ingest_contrastive(
+    text       : str,
+    graph      : Graph,
+    normalizer : Normalizer,
+    bm         : BellmanManager,
+    config     : Optional[IngestionConfig] = None,
+) -> IngestionStats:
+    """
+    Ingest text as a contrastive (negative) example.
+
+    Used for low-reward 7B model outputs during distillation.
+    The individual nodes still enter the graph — they may appear
+    in valid contexts elsewhere — but the sequential edges between
+    them are created as CONTRASTIVE type with forced negative reward.
+
+    This means:
+        - The nodes themselves are available for future collision
+        - The specific sequence encoded in this text is penalised
+        - MCTS will learn to avoid this transition pattern
+        - Bellman propagates the negative signal backward
+
+    The distinction from positive ingestion:
+        Positive  → SEQUENTIAL edges, reward from signal
+        Contrastive → CONTRASTIVE edges, reward forced negative
+
+    Operates at sentence level only — contrastive signal is most
+    meaningful at the sentence transition level where reasoning
+    coherence is assessed.
+    """
+    if config is None:
+        config = IngestionConfig(
+            max_level = Level.SENTENCE,
+            verbose   = False,
+        )
+
+    stats        = IngestionStats()
+    t0           = time.time()
+    seen_words   = set()
+    edge_counter = [0]
+
+    if not text or not text.strip():
+        return stats
+
+    paragraphs = text_to_paragraphs(text)
+
+    for para_text in paragraphs:
+        sentences    = text_to_sentences(para_text)
+        prev_sent_id = None
+        sent_context : list[str] = []
+
+        for sent_text in sentences:
+            words = sent_text.split()
+            if len(words) < config.min_sentence_words:
+                continue
+
+            # Create node normally — it may be valid elsewhere
+            sent_id, _ = get_or_create_node(
+                sent_text, Level.SENTENCE, graph, normalizer,
+                seen_words, sent_context, stats,
+            )
+            if sent_id is None:
+                continue
+
+            # Create CONTRASTIVE edge from previous sentence
+            # Only the edge is contrastive — the node itself is neutral
+            if prev_sent_id is not None and prev_sent_id != sent_id:
+                if not graph.edge_exists(prev_sent_id, sent_id):
+                    prev_node = graph.get_node(prev_sent_id)
+                    if prev_node:
+                        # Force contrastive edge type — reward will be negative
+                        graph.add_edge(
+                            prev_sent_id, sent_id,
+                            prev_node.text, sent_text,
+                            Level.SENTENCE,
+                            edge_type = EdgeType.CONTRASTIVE,
+                        )
+                        normalizer.on_edge_added(prev_sent_id, graph)
+                        bm.on_edge_added(prev_sent_id, sent_id)
+                        stats.edges_created += 1
+
+            prev_sent_id = sent_id
+            sent_context = sent_context[-2:] + [sent_text]
+            import re
+            seen_words |= set(re.findall(r'\b\w+\b', sent_text.lower()))
+
+    stats.documents_read = 1
+    bm.sweep(verbose=False)
+    stats.elapsed_sec = time.time() - t0
+    return stats
+
+
+def ingest_distillation_batch(
+    positive_texts  : list[str],
+    negative_texts  : list[str],
+    graph           : Graph,
+    normalizer      : Normalizer,
+    bm              : BellmanManager,
+    config          : Optional[IngestionConfig] = None,
+    verbose         : bool = False,
+) -> tuple[IngestionStats, IngestionStats]:
+    """
+    Ingest a batch of distillation outputs from the 7B model.
+
+    positive_texts : high-reward completions — ingested normally
+    negative_texts : low-reward completions — ingested as contrastive
+
+    Returns (positive_stats, negative_stats).
+
+    This is the main entry point called by distill.py after the
+    7B model generates completions and the reward function scores them.
+    The split between positive and negative is made by distill.py
+    before calling here — ingestion does not decide which is which.
+    """
+    if config is None:
+        config = IngestionConfig(
+            max_level  = Level.SENTENCE,
+            verbose    = False,
+            batch_size = 50,
+        )
+
+    pos_stats = IngestionStats()
+    neg_stats = IngestionStats()
+    t0        = time.time()
+    seen_words   = set()
+    edge_counter = [0]
+
+    # Positive — full normal ingestion
+    for text in positive_texts:
+        try:
+            ingest_document(
+                text, graph, normalizer, bm, config,
+                pos_stats, seen_words, edge_counter,
+            )
+            pos_stats.documents_read += 1
+        except Exception as e:
+            pos_stats.errors += 1
+            if verbose:
+                print(f"  Positive ingestion error: {e}")
+
+    # Negative — contrastive ingestion
+    for text in negative_texts:
+        try:
+            s = ingest_contrastive(text, graph, normalizer, bm, config)
+            neg_stats.documents_read += 1
+            neg_stats.nodes_created  += s.nodes_created
+            neg_stats.edges_created  += s.edges_created
+        except Exception as e:
+            neg_stats.errors += 1
+            if verbose:
+                print(f"  Contrastive ingestion error: {e}")
+
+    bm.sweep(verbose=verbose)
+
+    pos_stats.elapsed_sec = time.time() - t0
+    neg_stats.elapsed_sec = pos_stats.elapsed_sec
+
+    if verbose:
+        print(f"Distillation batch complete.")
+        print(f"  Positive: {pos_stats.nodes_created} nodes, "
+              f"{pos_stats.edges_created} edges")
+        print(f"  Contrastive: {neg_stats.nodes_created} nodes, "
+              f"{neg_stats.edges_created} contrastive edges")
+
+    return pos_stats, neg_stats
 
 
 if __name__ == "__main__":
