@@ -53,7 +53,13 @@ ADJACENT_LEVEL_PROB = 0.20
 # Cross-level is the remainder: 0.10
 
 # Pool size for V-weighted sampling — top N nodes per level
-SAMPLE_POOL_SIZE = 1000
+SAMPLE_POOL_SIZE = 5000
+
+# Levels eligible for collision sampling.
+# Restricted to SENTENCE only until CHARACTER and WORD nodes
+# are populated — PARAGRAPH and DOCUMENT nodes produce subgraphs
+# too large for MCTS to navigate in reasonable time.
+COLLISION_LEVELS = {Level.SENTENCE}
 
 # Minimum V value for a node to enter the sampling pool
 # — set well below the graph's average V so most nodes are included
@@ -206,8 +212,12 @@ class SamplingPool:
         return pool[idx]
 
     def available_levels(self) -> list[Level]:
-        """Levels with at least one node in their pool."""
-        return [lv for lv in Level if len(self.pools.get(lv, [])) >= 2]
+        """Levels with at least one node in their pool, restricted to COLLISION_LEVELS."""
+        return [
+            lv for lv in Level
+            if lv in COLLISION_LEVELS
+            and len(self.pools.get(lv, [])) >= 2
+        ]
 
 
 # ─────────────────────────────────────────────
