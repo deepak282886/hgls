@@ -56,8 +56,8 @@ ADJACENT_LEVEL_PROB = 0.20
 SAMPLE_POOL_SIZE = 1000
 
 # Minimum V value for a node to enter the sampling pool
-# — prevents near-zero nodes from dominating by count
-MIN_V_FOR_SAMPLING = -5.0
+# — set well below the graph's average V so most nodes are included
+MIN_V_FOR_SAMPLING = -25.0
 
 # Minimum path reward for a collision to form an edge
 MIN_PATH_REWARD = 0.0
@@ -168,7 +168,9 @@ class SamplingPool:
         self.graph     = graph
         self.pools     : dict[Level, list[Node]]    = {}
         self.weights   : dict[Level, np.ndarray]    = {}
-        self.last_refresh = -1
+        # Set to -POOL_REFRESH_INTERVAL so the very first
+        # call to refresh() triggers immediately at iteration 0
+        self.last_refresh = -POOL_REFRESH_INTERVAL
 
     def refresh(self, iteration: int):
         """Rebuild pools from current graph state."""
