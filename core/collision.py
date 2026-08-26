@@ -67,9 +67,9 @@ POOL_REFRESH_INTERVAL = 500
 
 # MCTS settings for collision — tighter than query-time
 # because we run thousands of collisions, not dozens of queries
-COLLISION_MCTS_ITER  = 50
-COLLISION_MAX_DEPTH  = 20
-COLLISION_MAX_HOPS   = 4
+COLLISION_MCTS_ITER  = 30
+COLLISION_MAX_DEPTH  = 10
+COLLISION_MAX_HOPS   = 3
 
 # How often to run a full Bellman sweep (iterations)
 BELLMAN_SWEEP_INTERVAL = 2000
@@ -221,44 +221,46 @@ def sample_pair(pool: SamplingPool) -> Optional[tuple[Node, Node]]:
         20%  adjacent levels (one step apart)
         10%  cross levels (two steps apart, within checker limit)
 
+    Only samples from levels that actually have nodes in their pool.
     Returns None if the pool is too sparse.
     """
     available = pool.available_levels()
-    if len(available) < 1:
+    if not available:
         return None
 
     roll = random.random()
 
     if roll < SAME_LEVEL_PROB:
-        # Same level
-        level = random.choice(available)
+        # Same level — pick from available levels weighted by pool size
+        weights = [len(pool.pools.get(lv, [])) for lv in available]
+        total   = sum(weights)
+        if total == 0:
+            return None
+        probs  = [w / total for w in weights]
+        level  = available[np.random.choice(len(available), p=probs)]
         a = pool.sample_from_level(level)
         b = pool.sample_from_level(level)
 
     elif roll < SAME_LEVEL_PROB + ADJACENT_LEVEL_PROB:
         # Adjacent levels
         if len(available) < 2:
-            level = random.choice(available)
+            level = available[0]
             a = pool.sample_from_level(level)
             b = pool.sample_from_level(level)
         else:
             level_a = random.choice(available)
-            # Find adjacent level
             adjacent = [
                 lv for lv in available
                 if abs(int(lv) - int(level_a)) == 1
             ]
-            if adjacent:
-                level_b = random.choice(adjacent)
-            else:
-                level_b = level_a
+            level_b = random.choice(adjacent) if adjacent else level_a
             a = pool.sample_from_level(level_a)
             b = pool.sample_from_level(level_b)
 
     else:
-        # Cross level (2 steps apart — within checker's tolerance)
+        # Cross level (2 steps apart)
         if len(available) < 2:
-            level = random.choice(available)
+            level = available[0]
             a = pool.sample_from_level(level)
             b = pool.sample_from_level(level)
         else:
@@ -267,10 +269,7 @@ def sample_pair(pool: SamplingPool) -> Optional[tuple[Node, Node]]:
                 lv for lv in available
                 if abs(int(lv) - int(level_a)) == 2
             ]
-            if cross:
-                level_b = random.choice(cross)
-            else:
-                level_b = level_a
+            level_b = random.choice(cross) if cross else level_a
             a = pool.sample_from_level(level_a)
             b = pool.sample_from_level(level_b)
 
@@ -505,6 +504,8 @@ class CollisionLoop:
         if not result:
             self.stats.record_kill(result.layer)
             return
+
+        self.stats.iterations += 1
 
         # ── Activate merged neighbourhood ────
         activation = activate_collision(node_a, node_b, self.graph)
