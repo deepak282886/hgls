@@ -504,11 +504,19 @@ class CollisionLoop:
         """
         Single collision attempt.
 
-        1. Run impossibility checker.
-        2. If passes — activate merged neighbourhood.
-        3. Run MCTS from A toward B.
-        4. If path reward > 0 — form edges, propagate Bellman.
+        1. Skip if A→B already directly connected.
+        2. Run impossibility checker.
+        3. Activate merged neighbourhood.
+        4. Run MCTS from A.
+        5. If path reward > MIN_PATH_REWARD:
+               - Form direct A→B associative edge (the collision product)
+               - Form edges along intermediate path (bonus signal)
+               - Propagate Bellman delta
         """
+        # ── Skip if already directly connected ──
+        if self.graph.edge_exists(node_a.node_id, node_b.node_id):
+            return
+
         # ── Layer check ──────────────────────
         result = self.checker.check(node_a, node_b)
         if not result:
@@ -521,7 +529,7 @@ class CollisionLoop:
         activation = activate_collision(node_a, node_b, self.graph)
 
         if not activation.lit:
-            self.stats.record_kill(1)
+            self.stats.record_mcts(succeeded=False)
             return
 
         # ── MCTS navigation A → B ───────────
@@ -537,16 +545,33 @@ class CollisionLoop:
         path        = mcts_result.best_path
         path_reward = mcts_result.total_reward
 
-        # ── Form edges if reward is positive ─
-        if path and path_reward > MIN_PATH_REWARD:
-            new_edges = form_edge_from_path(
-                path, self.graph, self.normalizer, self.bm
+        if not path or path_reward <= MIN_PATH_REWARD:
+            self.stats.record_mcts(succeeded=False)
+            return
+
+        # ── Form direct A→B edge (the collision product) ─
+        # This is the core of what collision means:
+        # A and B proved they can be connected → form a direct bond
+        new_edges = 0
+        if not self.graph.edge_exists(node_a.node_id, node_b.node_id):
+            self.graph.add_edge(
+                node_a.node_id, node_b.node_id,
+                node_a.text, node_b.text,
+                node_a.level,
+                edge_type = EdgeType.ASSOCIATIVE,
             )
-            if new_edges > 0:
-                self.stats.record_mcts(succeeded=True)
-            else:
-                # Path existed already — edges were already there
-                self.stats.record_mcts(succeeded=False)
+            self.normalizer.on_edge_added(node_a.node_id, self.graph)
+            self.bm.on_edge_added(node_a.node_id, node_b.node_id)
+            new_edges += 1
+
+        # ── Also form edges along intermediate path ──
+        # These are bonus connections discovered along the way
+        new_edges += form_edge_from_path(
+            path, self.graph, self.normalizer, self.bm
+        )
+
+        if new_edges > 0:
+            self.stats.record_mcts(succeeded=True)
         else:
             self.stats.record_mcts(succeeded=False)
 
