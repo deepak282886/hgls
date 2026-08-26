@@ -55,7 +55,7 @@ CONVERGENCE_EPS   = 0.01
 
 # Maximum iterations for full sweep
 # — safety limit, convergence usually happens in 3-5
-MAX_SWEEP_ITER    = 20
+MAX_SWEEP_ITER    = 50
 
 # Maximum hops for delta propagation backward
 # — prevents runaway propagation in densely connected graphs
@@ -64,6 +64,12 @@ MAX_DELTA_HOPS    = 100
 # How often (new edges) to trigger a full sweep
 # — between sweeps, delta propagation handles incremental updates
 FULL_SWEEP_EVERY  = 1000
+
+# Discount factor γ — CRITICAL for convergence.
+# Without γ < 1, cycles inflate V values indefinitely.
+# 0.95 means each hop contributes 95% of the previous,
+# forming a convergent geometric series even in cyclic graphs.
+GAMMA             = 0.95
 
 
 # ─────────────────────────────────────────────
@@ -96,7 +102,9 @@ def compute_V(node_id: int, graph: Graph) -> float:
         neighbor = graph.get_node(edge.target_id)
         if neighbor is None:
             continue
-        future = edge.reward + neighbor.V
+        # γ discount ensures convergence in cyclic graphs —
+        # each hop's contribution decays geometrically
+        future = edge.reward + GAMMA * neighbor.V
         if future > best_future:
             best_future = future
 
@@ -305,7 +313,7 @@ def on_node_reward_updated(
     if not edges:
         new_V = new_reward
     else:
-        best  = max(e.reward + graph.get_node(e.target_id).V
+        best  = max(e.reward + GAMMA * graph.get_node(e.target_id).V
                     for e in edges
                     if graph.get_node(e.target_id) is not None)
         new_V = new_reward + best
