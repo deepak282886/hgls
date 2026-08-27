@@ -523,6 +523,34 @@ class Graph:
         return row[0] if row else None
 
 
+    def search_nodes_by_keyword(
+        self,
+        keyword : str,
+        level   : Level,
+        limit   : int = 10,
+    ) -> list:
+        """
+        Find nodes at the given level whose text contains keyword.
+        Returns list of Nodes ordered by V descending — highest-value
+        matches first, so seeds are the most useful nodes for that term.
+
+        Used by activation.py for text-based query seeding.
+        SQLite LIKE is case-insensitive for ASCII by default.
+        """
+        rows = self._conn.execute(
+            "SELECT node_id FROM nodes "
+            "WHERE level=? AND text LIKE ? "
+            "ORDER BY V DESC LIMIT ?",
+            (int(level), f"%{keyword}%", limit)
+        ).fetchall()
+        nodes = []
+        for (nid,) in rows:
+            node = self.get_node(nid)
+            if node is not None:
+                nodes.append(node)
+        return nodes
+
+
     # ─────────────────────────────────────────
     # EDGE EXISTS CHECK
     # ─────────────────────────────────────────

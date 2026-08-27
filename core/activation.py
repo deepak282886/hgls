@@ -317,6 +317,33 @@ def normalize_activation(
 # ACTIVATE — main entry point
 # ─────────────────────────────────────────────
 
+def _extract_keywords(query: str, max_keywords: int = 8) -> list[str]:
+    """
+    Extract meaningful keywords from a query string.
+
+    Filters out stop words and very short tokens.
+    Returns the most distinctive terms — longer words first,
+    since "derivative" is more distinctive than "the".
+    """
+    import re
+    STOP_WORDS = {
+        'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been',
+        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+        'would', 'could', 'should', 'may', 'might', 'shall', 'can',
+        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+        'that', 'this', 'it', 'its', 'or', 'and', 'but', 'not',
+        'if', 'then', 'so', 'as', 'up', 'out', 'about', 'into',
+        'than', 'we', 'i', 'you', 'he', 'she', 'they', 'what',
+        'which', 'who', 'how', 'when', 'where', 'why', 'show',
+        'prove', 'find', 'let', 'give', 'take', 'make', 'get',
+    }
+    tokens = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+    keywords = [t for t in tokens if t not in STOP_WORDS]
+    # Sort by length descending — longer = more distinctive
+    keywords = sorted(set(keywords), key=len, reverse=True)
+    return keywords[:max_keywords]
+
+
 def activate(
     query      : str,
     graph      : Graph,
@@ -330,51 +357,78 @@ def activate(
     Main activation entry point.
 
     Given a query string:
-    1. Embed the query at the given level (or all levels)
-    2. Find top-K seed nodes by similarity
+    1. Extract keywords from the query
+    2. Find seed nodes via SQLite text search (keyword matching)
+       Seeds are nodes whose text contains the query keywords,
+       ordered by V — the graph's own value landscape picks
+       the best entry points, not embedding similarity.
     3. Spread activation from seeds along edges
     4. Trim and normalize the lit subgraph
     5. Return ActivationResult
 
-    The level parameter controls which level of the hierarchy
-    is primarily activated:
-        None     → search all levels, let similarity decide
-        SENTENCE → activate at sentence level (most common)
-        WORD     → activate at word level (keyword queries)
-        etc.
+    This is correct for the architecture: the graph was shaped by
+    reward and co-occurrence. The query activates nodes that literally
+    contain the query's concepts, then the V landscape and edges
+    guide what gets lit up from there. No embedding similarity needed.
     """
     if not query.strip():
         return ActivationResult(lit={}, seeds=[], query=None, level=level)
 
-    # Determine primary level for embedding
     primary_level = level if level is not None else Level.SENTENCE
 
-    # 1. Embed query
-    query_emb = embed_query(query, primary_level)
+    # 1. Extract keywords from query
+    keywords = _extract_keywords(query)
 
-    # 2. Similarity spread — find seed nodes
-    sim_acts = similarity_spread(
-        query_emb, graph,
-        level     = level,
-        top_k     = top_k_seeds,
-        threshold = threshold,
-    )
+    if not keywords:
+        return ActivationResult(lit={}, seeds=[], query=None, level=primary_level)
 
-    if not sim_acts:
-        # No similar nodes found — return empty
-        return ActivationResult(
-            lit=[], seeds=[], query=query_emb, level=primary_level
+    # 2. Find seed nodes by keyword text match
+    # Each keyword contributes seeds — initial activation weighted
+    # by keyword position (earlier = more distinctive)
+    seed_activations: dict[int, float] = {}
+    seeds_per_keyword = max(2, top_k_seeds // len(keywords))
+
+    for rank, keyword in enumerate(keywords):
+        # Weight decays slightly for lower-ranked keywords
+        keyword_weight = 1.0 / (1.0 + rank * 0.2)
+
+        matches = graph.search_nodes_by_keyword(
+            keyword, primary_level,
+            limit = seeds_per_keyword,
         )
 
-    seed_ids = list(sim_acts.keys())
+        for node in matches:
+            nid = node.node_id
+            # Combine: keyword weight × normalized V
+            # norm_V is in [0,1] — higher V nodes seed stronger
+            v_weight = max(0.1, (node.norm_V + 1.0) / 2.0)
+            activation = keyword_weight * v_weight
+
+            if nid in seed_activations:
+                # Node matched multiple keywords — boost it
+                seed_activations[nid] = min(1.0, seed_activations[nid] + activation * 0.5)
+            else:
+                seed_activations[nid] = activation
+
+    if not seed_activations:
+        return ActivationResult(
+            lit={}, seeds=[], query=None, level=primary_level
+        )
+
+    # Normalize seed activations to [0, 1]
+    max_seed = max(seed_activations.values())
+    if max_seed > 1e-9:
+        seed_activations = {k: v / max_seed for k, v in seed_activations.items()}
+
+    seed_ids = list(seed_activations.keys())
 
     # 3. Edge spread from seeds
     full_acts = edge_spread(
-        seeds      = seed_ids,
-        graph      = graph,
-        max_hops   = max_hops,
-        threshold  = threshold,
-        initial_activations = sim_acts,
+        seeds               = seed_ids,
+        graph               = graph,
+        max_hops            = max_hops,
+        threshold           = threshold,
+        initial_activations = seed_activations,
     )
 
     # 4. Trim and normalize
@@ -383,7 +437,7 @@ def activate(
     return ActivationResult(
         lit   = norm_acts,
         seeds = seed_ids,
-        query = query_emb,
+        query = None,      # no embedding query in this architecture
         level = primary_level,
     )
 

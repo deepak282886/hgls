@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 from core.atoms import Level, EMBEDDING_DIM, REWARD_SCALE, text_to_characters, char_to_id
+import hashlib
+import re
 
 
 # ─────────────────────────────────────────────
@@ -225,45 +227,54 @@ def compute_embedding(text: str, level: Level) -> np.ndarray:
 
     elif level == Level.SENTENCE:
         # dim=128
-        words = text.split()
-        nw    = len(words)
+        # Word feature hashing — genuine lexical semantic signal.
+        # Each word is hashed to 3 positions in [0, 118) with
+        # deterministic signs. "derivative" always activates the
+        # same positions; "Alfonso" activates completely different ones.
+        # Cosine similarity now reflects shared vocabulary, not
+        # shared character statistics.
+        #
+        # Last 10 dims: structural features (math presence, length, etc.)
+        # These help distinguish math sentences from prose even when
+        # vocabulary doesn't overlap.
 
-        # Character frequency over full sentence (first 48 dims)
-        freq = np.zeros(97, dtype=np.float32)
-        for cid in ids:
-            if cid < 97:
-                freq[cid] += 1
-        freq /= (n + 1e-9)
-        emb[:48] = freq[:48]
+        # Tokenize — only meaningful words (length >= 2, alphabetic)
+        # Also keep math keywords and short identifiers
+        raw_words = re.findall(r'\b\w+\b', text.lower())
+        words_meaningful = [w for w in raw_words if len(w) >= 2]
 
-        # Word count features
-        emb[48] = min(nw, 60) / 60.0               # normalized word count
-        emb[49] = min(n,  300) / 300.0             # normalized char count
-        emb[50] = float(text.strip()[-1] == '.')   # declarative
-        emb[51] = float(text.strip()[-1] == '?')   # interrogative
-        emb[52] = float(text.strip()[-1] == '!')   # exclamatory
-        emb[53] = float(text[0].isupper())         # proper start
+        acc = np.zeros(dim, dtype=np.float32)
+        HASH_DIMS = 118   # dims reserved for word hashing
 
-        # Lexical diversity — unique words / total words
-        unique_words = len(set(w.lower() for w in words))
-        emb[54] = unique_words / (nw + 1e-9)
+        if words_meaningful:
+            weight = 1.0 / len(words_meaningful)
+            for word in words_meaningful:
+                # 3 hash functions per word — reduces collisions
+                for salt in range(3):
+                    h    = hashlib.md5(f"{word}_{salt}".encode()).digest()
+                    pos  = int.from_bytes(h[:4], 'big') % HASH_DIMS
+                    sign = 1.0 if h[4] % 2 == 0 else -1.0
+                    acc[pos] += sign * weight
 
-        # Average word length
-        avg_wlen = np.mean([len(w) for w in words]) if words else 0
-        emb[55] = min(avg_wlen, 15) / 15.0
+        # Structural features in last 10 dims
+        words_all = text.split()
+        nw        = len(words_all)
+        last_char = text.strip()[-1] if text.strip() else ''
 
-        # Digit presence ratio
-        digit_chars = sum(c.isdigit() for c in text)
-        emb[56] = digit_chars / (n + 1e-9)
+        acc[118] = min(nw, 60) / 60.0                                          # word count
+        acc[119] = min(n,  300) / 300.0                                         # char count
+        acc[120] = float(last_char == '.')                                       # declarative
+        acc[121] = float(last_char == '?')                                       # interrogative
+        acc[122] = float(text[0].isupper()) if text else 0.0                    # proper start
+        acc[123] = (len(set(w.lower() for w in words_all)) /
+                    (nw + 1e-9))                                                 # lexical diversity
+        acc[124] = sum(c.isdigit() for c in text) / (n + 1e-9)                 # digit ratio
+        acc[125] = sum(1 for c in text if c in '∫∂∑∏√±≈≠≤≥') / (n + 1e-9)    # math symbols
+        acc[126] = (sum(1 for w in words_meaningful if len(w) > 8) /
+                    (len(words_meaningful) + 1e-9))                             # technical word ratio
+        acc[127] = text.count('$') / (n + 1e-9)                                # LaTeX presence
 
-        # Positional character encoding (dims 57-127)
-        step = max(1, n // (dim - 57))
-        for k, pos in enumerate(range(0, n, step)):
-            slot = 57 + k
-            if slot >= dim:
-                break
-            cid = ids[pos] if pos < len(ids) else 0
-            emb[slot] = np.sin(cid / 97.0 * np.pi) * np.cos(pos / (n + 1e-9) * np.pi)
+        emb = acc
 
     elif level == Level.PARAGRAPH:
         # dim=256

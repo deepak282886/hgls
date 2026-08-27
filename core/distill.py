@@ -1,62 +1,53 @@
 """
 distill.py
 
-7B model distillation pipeline.
+Ollama-based reasoning agent for graph distillation.
 
-Queries a 7B parameter language model and uses its outputs as
-corpus material for the graph — not as ground truth reasoning,
-but as a source of fluent, domain-spanning text that the graph
-then reorganises through its own reward function and collision loop.
+A dedicated agent whose sole job is to grow the graph.
+It reasons through mathematical topics step by step,
+and every reasoning chain gets ingested into the graph.
 
-The 7B model is used as a corpus generator, not as a teacher.
-Hallucinations and incoherence enter the graph but receive low
-reward and weak edges. Selection pressure handles them over time.
+The agent:
+    1. Picks a topic from the curriculum
+    2. Asks the model to reason through it step by step
+    3. Extracts the reasoning chain (especially <think> blocks)
+    4. Scores each completion with the reward function
+    5. Ingests high-reward chains as positive nodes/edges
+    6. Ingests low-reward chains as contrastive edges
+    7. Queries the graph to find weak areas and focuses there next
 
-Hardware target: 8GB VRAM
-    7B model in 4-bit NF4 quantization: ~4.0–4.5 GB VRAM
-    Leaves ~3.5 GB for KV cache and activations.
-    Batch size 4 at max_new_tokens=256 fits comfortably.
-    Batch size 8 is possible but tight — use with short inputs.
+The model is the teacher. The graph is the student.
+The collision loop runs alongside, finding connections
+the agent didn't make explicitly.
 
-Quantization:
-    bitsandbytes NF4 with double quantization enabled.
-    Compute dtype: float16.
-    This is the standard setup for 7B on consumer GPUs.
+Ollama must be running locally:
+    ollama serve   (in a separate terminal if not already running)
+    ollama pull deepseek-r1:1.5b
 
-Flow:
-    1. Load prompts from JSONL file
-    2. Generate completions in batches (batch_size=4 default)
-    3. Score each completion with the reward function
-    4. Split by threshold:
-           score > threshold  → positive ingestion
-           score ≤ threshold  → contrastive ingestion
-    5. Yield (positive_texts, negative_texts) per batch
-       for ingest_distillation_batch() in main.py
-
-The Distiller keeps the model loaded across all batches.
-Load once, generate everything, then release.
-
-Supported model sources:
-    HuggingFace hub: "mistralai/Mistral-7B-Instruct-v0.2"
-    Local path:      "/models/mistral-7b"
-    GGUF (future):   not supported — use transformers only
-
-Recommended models for 8GB VRAM (4-bit):
-    mistralai/Mistral-7B-Instruct-v0.2    (~4.1 GB)
-    meta-llama/Meta-Llama-3-8B-Instruct   (~4.5 GB)
-    microsoft/Phi-3-mini-4k-instruct      (~2.2 GB, fastest)
+Usage:
+    python -m core.main distill --prompts math_prompts.jsonl
+    (model defaults to deepseek-r1:1.5b via Ollama)
 """
 
 import json
 import time
 import re
+import random
+import requests
 from dataclasses import dataclass, field
 from pathlib     import Path
 from typing      import Iterator, Optional
 
-from core.atoms  import Level
+from core.atoms  import Level, text_to_sentences
 from core.reward import node_reward
-from core.atoms  import text_to_sentences
+
+
+# ─────────────────────────────────────────────
+# OLLAMA CONFIG
+# ─────────────────────────────────────────────
+
+OLLAMA_URL      = "http://localhost:11434/api/chat"
+OLLAMA_TIMEOUT  = 120   # seconds per request
 
 
 # ─────────────────────────────────────────────
@@ -66,85 +57,136 @@ from core.atoms  import text_to_sentences
 @dataclass
 class DistillConfig:
     """
-    Configuration for the distillation pipeline.
+    Configuration for the distillation agent.
 
-    model_name       : HuggingFace model ID or local path
-    prompts_path     : JSONL file of prompts — one per line,
-                       {"prompt": "..."} or {"text": "..."}
-    reward_threshold : completions above this go positive,
-                       at or below go contrastive (default 0.0)
-    batch_size       : prompts per generation batch.
-                       Keep at 4 for 8GB VRAM with 256 new tokens.
-                       Drop to 2 if OOM errors occur.
-    max_new_tokens   : max tokens per completion (default 256)
-    temperature      : generation temperature (default 0.8)
-                       Higher = more diverse but less coherent.
-    top_p            : nucleus sampling cutoff (default 0.9)
-    device_map       : "auto" lets accelerate assign layers.
-                       On single GPU this puts everything on cuda:0.
-    load_in_4bit     : enable 4-bit NF4 quantization (default True)
-                       Set False only if you have >14GB VRAM.
-    verbose          : print scoring and routing per batch
+    model_name       : Ollama model tag (default: deepseek-r1:1.5b)
+    prompts_path     : JSONL file of prompts
+    reward_threshold : above → positive ingestion, below → contrastive
+    batch_size       : prompts per batch
+    max_new_tokens   : max tokens per completion
+    temperature      : generation temperature
+    verbose          : print per-completion scoring
     """
-    model_name       : str   = "mistralai/Mistral-7B-Instruct-v0.2"
+    model_name       : str   = "deepseek-r1:1.5b"
     prompts_path     : str   = ""
     reward_threshold : float = 0.0
     batch_size       : int   = 4
-    max_new_tokens   : int   = 256
-    temperature      : float = 0.8
-    top_p            : float = 0.9
-    device_map       : str   = "auto"
-    load_in_4bit     : bool  = True
+    max_new_tokens   : int   = 512
+    temperature      : float = 0.7
     verbose          : bool  = True
+
+
+# ─────────────────────────────────────────────
+# MATH CURRICULUM
+# Structured topics for the agent to reason through
+# ─────────────────────────────────────────────
+
+MATH_CURRICULUM = [
+    # Calculus
+    "Explain step by step how to find the derivative of x squared using the power rule.",
+    "Walk through the proof that the derivative of sin(x) is cos(x).",
+    "Explain the chain rule for differentiation with a worked example.",
+    "Prove the product rule for derivatives from first principles.",
+    "Walk through computing the integral of x squared step by step.",
+    "Explain what a limit is and how to compute lim(x->0) sin(x)/x.",
+    "Prove that the derivative of e^x is e^x.",
+    "Explain the fundamental theorem of calculus with a clear example.",
+    "Walk through finding the critical points of f(x) = x^3 - 3x.",
+    "Explain L'Hopital's rule and when to use it.",
+
+    # Algebra
+    "Prove the quadratic formula by completing the square.",
+    "Explain how to solve a system of two linear equations step by step.",
+    "Walk through factoring x^2 - 5x + 6 completely.",
+    "Prove that the sum of first n integers equals n(n+1)/2.",
+    "Explain logarithm properties with examples: log(ab), log(a/b), log(a^n).",
+    "Walk through solving 2^x = 8 using logarithms.",
+    "Prove that if a divides b and b divides c then a divides c.",
+    "Explain the binomial theorem with a worked example.",
+
+    # Number theory
+    "Prove there are infinitely many prime numbers.",
+    "Explain the Euclidean algorithm for finding GCD with an example.",
+    "Prove that the square root of 2 is irrational.",
+    "Explain Fermat's little theorem with a numerical example.",
+    "Walk through the sieve of Eratosthenes to find primes up to 30.",
+    "Prove that every integer greater than 1 has a prime factorization.",
+
+    # Proofs and logic
+    "Prove by induction that 2^n > n for all positive integers n.",
+    "Explain proof by contradiction with a clear example.",
+    "Prove that there are no integer solutions to x^2 + y^2 = 3 mod 4.",
+    "Walk through a direct proof that the sum of two even numbers is even.",
+    "Explain mathematical induction and prove the sum of odd numbers is n^2.",
+
+    # Geometry
+    "Prove the Pythagorean theorem using area.",
+    "Explain why the sum of angles in a triangle is 180 degrees.",
+    "Prove that the area of a circle is pi*r^2.",
+    "Walk through finding the distance between two points using coordinates.",
+
+    # Statistics and probability
+    "Explain the central limit theorem intuitively.",
+    "Walk through computing the expected value of rolling a fair die.",
+    "Explain Bayes theorem with a concrete medical test example.",
+    "Prove that variance is always non-negative.",
+]
+
+
+# ─────────────────────────────────────────────
+# SYSTEM PROMPT — gives the agent its persona
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a mathematical reasoning agent. Your job is to think through mathematical problems carefully and step by step. 
+
+When given a mathematical topic:
+- Reason through it explicitly, showing every step
+- State definitions clearly before using them
+- Explain WHY each step follows from the previous
+- Use precise mathematical language
+- Think out loud — your reasoning process is what matters, not just the answer
+
+Your responses become training material for a mathematical knowledge graph. Every sentence you write should be a clear, standalone mathematical statement that connects logically to the next."""
 
 
 # ─────────────────────────────────────────────
 # PROMPT READER
 # ─────────────────────────────────────────────
 
-def read_prompts(path: str) -> Iterator[str]:
+def read_prompts(path: str) -> list[str]:
     """
     Read prompts from a JSONL file.
-
-    Accepted formats per line:
-        {"prompt": "..."}
-        {"text": "..."}
-        {"question": "..."}
-        "raw string"
-
-    Prompts that are too short (<10 chars) are skipped.
+    Falls back to built-in curriculum if file is empty or missing.
     """
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Prompts file not found: {path}")
+    prompts = []
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, str):
-                    prompt = obj
-                elif isinstance(obj, dict):
-                    prompt = (
-                        obj.get("prompt") or
-                        obj.get("text")   or
-                        obj.get("question") or
-                        ""
-                    )
-                else:
+    if path and Path(path).exists():
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, str):
+                        prompt = obj
+                    elif isinstance(obj, dict):
+                        prompt = (obj.get("prompt") or
+                                  obj.get("text") or
+                                  obj.get("question") or "")
+                    else:
+                        continue
+                    prompt = str(prompt).strip()
+                    if len(prompt) >= 10:
+                        prompts.append(prompt)
+                except json.JSONDecodeError:
+                    if len(line) >= 10:
+                        prompts.append(line)
 
-                prompt = str(prompt).strip()
-                if len(prompt) >= 10:
-                    yield prompt
+    if not prompts:
+        prompts = MATH_CURRICULUM.copy()
 
-            except json.JSONDecodeError:
-                # Treat line as raw text prompt
-                if len(line) >= 10:
-                    yield line
+    return prompts
 
 
 # ─────────────────────────────────────────────
@@ -153,24 +195,16 @@ def read_prompts(path: str) -> Iterator[str]:
 
 def score_completion(text: str) -> float:
     """
-    Score a model completion using the graph's reward function.
-
-    Splits text into sentences and computes the average node
-    reward across all sentences. This gives a stable signal
-    even for short completions.
-
-    Returns a signed float — positive = coherent and novel,
-    negative = incoherent or repetitive.
-
-    Uses an empty seen_words set — no prior context assumed.
-    The graph will provide real context when the text is ingested.
+    Score a completion using the graph's reward function.
+    Splits into sentences and averages node reward.
+    Returns signed float — positive = coherent and novel.
     """
     sentences = text_to_sentences(text)
     if not sentences:
         return -1.0
 
-    rewards = []
-    seen_words: set = set()
+    rewards    = []
+    seen_words : set = set()
 
     for sent in sentences:
         words = sent.split()
@@ -192,240 +226,190 @@ def score_completion(text: str) -> float:
 
 
 # ─────────────────────────────────────────────
-# DISTILLER
+# EXTRACT REASONING
+# Pull out the most useful content from model output
+# ─────────────────────────────────────────────
+
+def extract_reasoning(text: str) -> str:
+    """
+    Clean up the combined thinking + content text.
+    Remove any residual <think> tags if present.
+    """
+    text = re.sub(r'<think>|</think>', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ─────────────────────────────────────────────
+# OLLAMA GENERATION
+# ─────────────────────────────────────────────
+
+def generate_ollama(
+    prompt      : str,
+    model       : str,
+    system      : str,
+    temperature : float,
+    max_tokens  : int,
+) -> str:
+    """
+    Generate a completion via Ollama chat API.
+    Returns the completion text or empty string on failure.
+    """
+    payload = {
+        "model"    : model,
+        "messages" : [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        "stream"  : False,
+        "options" : {
+            "temperature"    : temperature,
+            "num_predict"    : max_tokens,
+            "top_p"          : 0.9,
+            "repeat_penalty" : 1.1,
+        },
+    }
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json    = payload,
+            timeout = OLLAMA_TIMEOUT,
+        )
+        response.raise_for_status()
+        data    = response.json()
+        message = data.get("message", {})
+
+        # DeepSeek-R1 returns thinking separately from content
+        # thinking = raw step-by-step reasoning (primary graph material)
+        # content  = formatted final answer (secondary)
+        thinking = message.get("thinking", "").strip()
+        content  = message.get("content",  "").strip()
+
+        if thinking and content:
+            return thinking + "\n\n" + content
+        return (thinking or content)
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Cannot connect to Ollama. "
+            "Make sure Ollama is running: ollama serve"
+        )
+    except Exception as e:
+        return ""
+
+
+def format_prompt(system: str, user: str) -> str:
+    """
+    Format prompt for DeepSeek-R1 via Ollama.
+    DeepSeek-R1 uses a simple concatenation — no special tokens needed
+    when going through Ollama's API directly.
+    """
+    return f"{system}\n\n{user}"
+
+
+# ─────────────────────────────────────────────
+# DISTILLER — AGENT LOOP
 # ─────────────────────────────────────────────
 
 class Distiller:
     """
-    Loads a 7B model once and generates completions in batches.
+    Ollama-based reasoning agent for graph distillation.
 
     Usage:
-        config   = DistillConfig(model_name="...", prompts_path="...")
+        config    = DistillConfig(model_name="deepseek-r1:1.5b", ...)
         distiller = Distiller(config)
         for positive_texts, negative_texts in distiller.generate_batches():
             ingest_distillation_batch(positive_texts, negative_texts, ...)
     """
 
     def __init__(self, config: DistillConfig):
-        self.config    = config
-        self.model     = None
-        self.tokenizer = None
-        self.pipeline  = None
-        self._load_model()
+        self.config = config
+        self._verify_ollama()
 
-    def _load_model(self):
-        """
-        Load the model with 4-bit NF4 quantization for 8GB VRAM.
-
-        Memory breakdown at 4-bit:
-            Mistral 7B  : ~4.1 GB model weights
-            KV cache    : ~1.5 GB at batch=4, seq=512
-            Activations : ~0.5 GB
-            Total       : ~6.1 GB — fits in 8GB with headroom
-
-        If you see CUDA OOM:
-            - Reduce batch_size to 2
-            - Reduce max_new_tokens to 128
-            - Or switch to Phi-3-mini (~2.2 GB in 4-bit)
-        """
+    def _verify_ollama(self):
+        """Check that Ollama is running and the model is available."""
         try:
-            import torch
-            from transformers import (
-                AutoTokenizer,
-                AutoModelForCausalLM,
-                BitsAndBytesConfig,
-                pipeline as hf_pipeline,
+            r = requests.get("http://localhost:11434/api/tags", timeout=5)
+            r.raise_for_status()
+            models = [m["name"] for m in r.json().get("models", [])]
+
+            # Check if our model is available (match by prefix)
+            model_base = self.config.model_name.split(":")[0]
+            available  = any(model_base in m for m in models)
+
+            if not available:
+                print(f"  Warning: '{self.config.model_name}' not found in Ollama.")
+                print(f"  Available: {models}")
+                print(f"  Run: ollama pull {self.config.model_name}")
+
+            if self.config.verbose:
+                print(f"\nOllama connected.")
+                print(f"  Model:    {self.config.model_name}")
+                print(f"  Endpoint: {OLLAMA_URL}")
+                if available:
+                    print(f"  Status:   model ready\n")
+
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(
+                "\nCannot connect to Ollama at localhost:11434.\n"
+                "Start Ollama first:\n"
+                "  1. Open a new terminal\n"
+                "  2. Run: ollama serve\n"
+                "  3. Then re-run distillation\n"
             )
-        except ImportError:
-            raise ImportError(
-                "transformers and bitsandbytes required for distillation.\n"
-                "Install with: pip install transformers bitsandbytes accelerate"
-            )
-
-        if self.config.verbose:
-            print(f"\nLoading model: {self.config.model_name}")
-            print(f"  Quantization: {'4-bit NF4' if self.config.load_in_4bit else 'fp16'}")
-            print(f"  Device map:   {self.config.device_map}")
-
-        t0 = time.time()
-
-        # ── Quantization config ──────────────
-        if self.config.load_in_4bit:
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit              = True,
-                bnb_4bit_quant_type       = "nf4",        # NF4 is best for LLMs
-                bnb_4bit_compute_dtype    = torch.float16, # compute in fp16
-                bnb_4bit_use_double_quant = True,          # saves ~0.4 GB extra
-            )
-        else:
-            quant_config = None
-
-        # ── Tokenizer ────────────────────────
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_name,
-            padding_side = "left",   # left-pad for batch generation
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # ── Model ────────────────────────────
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name,
-            quantization_config = quant_config,
-            device_map          = self.config.device_map,
-            torch_dtype         = torch.float16,
-            trust_remote_code   = True,   # needed for some models (Phi-3)
-        )
-        self.model.eval()
-
-        # ── Pipeline ─────────────────────────
-        # Using HF pipeline for clean batched generation
-        self.pipeline = hf_pipeline(
-            "text-generation",
-            model     = self.model,
-            tokenizer = self.tokenizer,
-        )
-
-        elapsed = time.time() - t0
-        if self.config.verbose:
-            print(f"  Model loaded in {elapsed:.1f}s\n")
-
-    def _format_prompt(self, prompt: str) -> str:
-        """
-        Format a raw prompt into the model's chat template if available.
-
-        Falls back to raw prompt if the tokenizer has no chat template.
-        Mistral and LLaMA 3 both have chat templates — this ensures
-        the instruction format is correct for instruct models.
-        """
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                return self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize        = False,
-                    add_generation_prompt = True,
-                )
-            except Exception:
-                pass
-        return prompt
-
-    def _generate_batch(self, prompts: list[str]) -> list[str]:
-        """
-        Generate completions for a batch of prompts.
-
-        Returns list of completion strings (prompt stripped out).
-
-        Generation parameters:
-            temperature = config.temperature (default 0.8)
-                          Lower for more consistent quality,
-                          higher for more diverse corpus coverage.
-            top_p       = 0.9 (nucleus sampling)
-            do_sample   = True (sampling, not greedy)
-            batch_size  = config.batch_size
-
-        On 8GB VRAM with 4-bit Mistral 7B:
-            batch_size=4, max_new_tokens=256 → ~2-3 seconds per batch
-            batch_size=4, max_new_tokens=512 → ~4-6 seconds per batch
-        """
-        formatted = [self._format_prompt(p) for p in prompts]
-
-        outputs = self.pipeline(
-            formatted,
-            max_new_tokens = self.config.max_new_tokens,
-            temperature    = self.config.temperature,
-            top_p          = self.config.top_p,
-            do_sample      = True,
-            pad_token_id   = self.tokenizer.pad_token_id,
-            batch_size     = self.config.batch_size,
-            return_full_text = False,   # only return the new tokens
-        )
-
-        completions = []
-        for out in outputs:
-            if isinstance(out, list):
-                text = out[0].get("generated_text", "")
-            else:
-                text = out.get("generated_text", "")
-            completions.append(text.strip())
-
-        return completions
 
     def generate_batches(self) -> Iterator[tuple[list[str], list[str]]]:
         """
-        Main generation loop.
+        Main agent loop.
 
-        Reads prompts, generates in batches, scores each completion,
-        splits into positive and negative, yields per batch.
-
-        Yields:
-            (positive_texts, negative_texts)
-            where positive_texts are completions with score > threshold
-            and   negative_texts are completions with score ≤ threshold
-
-        The caller (main.py cmd_distill) passes these to
-        ingest_distillation_batch().
+        Reads prompts, generates reasoning chains via Ollama,
+        scores each chain, splits into positive/negative,
+        yields per batch for ingestion.
         """
-        prompts_buffer: list[str] = []
-        batch_num     = 0
-        total_prompts = 0
-        total_pos     = 0
-        total_neg     = 0
+        prompts    = read_prompts(self.config.prompts_path)
+        batch_size = self.config.batch_size
 
-        for prompt in read_prompts(self.config.prompts_path):
-            prompts_buffer.append(prompt)
-            total_prompts += 1
+        if self.config.verbose:
+            print(f"Starting agent loop.")
+            print(f"  Prompts:   {len(prompts)}")
+            print(f"  Batch:     {batch_size}")
+            print(f"  Threshold: {self.config.reward_threshold}\n")
 
-            if len(prompts_buffer) < self.config.batch_size:
+        total_pos   = 0
+        total_neg   = 0
+        batch_num   = 0
+        prompt_buf  : list[str] = []
+
+        # Shuffle so the agent covers topics in varied order
+        random.shuffle(prompts)
+
+        for prompt in prompts:
+            prompt_buf.append(prompt)
+
+            if len(prompt_buf) < batch_size:
                 continue
 
-            # Process batch
             batch_num += 1
-            positive, negative = self._process_batch(
-                prompts_buffer, batch_num
-            )
+            positive, negative = self._process_batch(prompt_buf, batch_num)
             total_pos += len(positive)
             total_neg += len(negative)
-
-            if self.config.verbose:
-                print(
-                    f"  Batch {batch_num:4d}  "
-                    f"prompts={len(prompts_buffer)}  "
-                    f"positive={len(positive)}  "
-                    f"negative={len(negative)}"
-                )
 
             yield positive, negative
-            prompts_buffer = []
+            prompt_buf = []
 
-        # Flush remaining prompts
-        if prompts_buffer:
+        # Flush remaining
+        if prompt_buf:
             batch_num += 1
-            positive, negative = self._process_batch(
-                prompts_buffer, batch_num
-            )
+            positive, negative = self._process_batch(prompt_buf, batch_num)
             total_pos += len(positive)
             total_neg += len(negative)
-
-            if self.config.verbose:
-                print(
-                    f"  Batch {batch_num:4d} (final)  "
-                    f"prompts={len(prompts_buffer)}  "
-                    f"positive={len(positive)}  "
-                    f"negative={len(negative)}"
-                )
-
             yield positive, negative
 
         if self.config.verbose:
-            print(f"\nGeneration complete.")
-            print(f"  Total prompts : {total_prompts}")
-            print(f"  Total batches : {batch_num}")
-            print(f"  Positive      : {total_pos}")
-            print(f"  Negative      : {total_neg}")
-            if total_prompts > 0:
-                pos_rate = total_pos / total_prompts
-                print(f"  Positive rate : {pos_rate:.1%}")
+            print(f"\nAgent loop complete.")
+            print(f"  Batches:  {batch_num}")
+            print(f"  Positive: {total_pos}")
+            print(f"  Negative: {total_neg}")
 
     def _process_batch(
         self,
@@ -433,62 +417,51 @@ class Distiller:
         batch_num : int,
     ) -> tuple[list[str], list[str]]:
         """
-        Generate, score, and split one batch.
-
-        Returns (positive_texts, negative_texts).
+        Generate, extract reasoning, score, and split one batch.
         """
-        try:
-            completions = self._generate_batch(prompts)
-        except Exception as e:
-            if self.config.verbose:
-                print(f"  Generation error in batch {batch_num}: {e}")
-            return [], []
+        positive : list[str] = []
+        negative : list[str] = []
 
-        positive: list[str] = []
-        negative: list[str] = []
+        for prompt in prompts:
+            # Generate via Ollama
+            raw_output = generate_ollama(
+                prompt      = prompt,
+                model       = self.config.model_name,
+                system      = SYSTEM_PROMPT,
+                temperature = self.config.temperature,
+                max_tokens  = self.config.max_new_tokens,
+            )
 
-        for prompt, completion in zip(prompts, completions):
-            if not completion or len(completion.strip()) < 10:
+            if not raw_output or len(raw_output.strip()) < 20:
+                if self.config.verbose:
+                    print(f"  [batch {batch_num}] Empty output for: {prompt[:50]}...")
                 continue
 
-            # Score the completion (not the prompt+completion combined —
-            # we want to know if the output itself is good)
-            score = score_completion(completion)
+            # Extract the reasoning content
+            reasoning = extract_reasoning(raw_output)
+
+            if not reasoning or len(reasoning.strip()) < 20:
+                continue
+
+            # Score the reasoning chain
+            score = score_completion(reasoning)
+
+            routing = "+" if score > self.config.reward_threshold else "-"
 
             if self.config.verbose:
-                preview = completion[:60].replace('\n', ' ')
-                routing = "+" if score > self.config.reward_threshold else "-"
-                print(f"    [{routing}] score={score:+.3f}  {preview}...")
+                preview = reasoning[:80].replace('\n', ' ')
+                print(f"  [{routing}] score={score:+.3f}  {preview}...")
 
             if score > self.config.reward_threshold:
-                # Positive: ingest with sequential edges
-                positive.append(completion)
+                positive.append(reasoning)
             else:
-                # Negative: ingest with contrastive edges
-                negative.append(completion)
+                negative.append(reasoning)
 
         return positive, negative
 
     def release(self):
-        """
-        Release model from GPU memory.
-
-        Call when distillation is complete and you want to free
-        VRAM for other processes (e.g., if running inference tests).
-        """
-        try:
-            import torch
-            if self.model is not None:
-                del self.model
-                self.model = None
-            if self.pipeline is not None:
-                del self.pipeline
-                self.pipeline = None
-            torch.cuda.empty_cache()
-            if self.config.verbose:
-                print("Model released from GPU memory.")
-        except Exception:
-            pass
+        """No-op for Ollama — model lives in Ollama process, not here."""
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -498,91 +471,39 @@ class Distiller:
 def generate_math_prompts(output_path: str, n: int = 1000):
     """
     Generate a starter set of mathematical reasoning prompts.
-
-    Covers arithmetic, algebra, calculus, number theory, proofs.
-    Saves to a JSONL file that can be passed to --prompts.
-
-    Usage:
-        from core.distill import generate_math_prompts
-        generate_math_prompts("math_prompts.jsonl", n=5000)
+    Saves to a JSONL file.
     """
-    templates = [
-        # Arithmetic
-        "Explain how to add fractions with different denominators.",
-        "What is the difference between a prime number and a composite number?",
-        "Prove that the square root of 2 is irrational.",
-        "Explain the distributive property of multiplication over addition.",
-        "What is modular arithmetic and how is it used?",
-        # Algebra
-        "How do you solve a system of two linear equations?",
-        "What is the quadratic formula and how is it derived?",
-        "Explain what a function is in mathematics.",
-        "What is the difference between permutations and combinations?",
-        "How do logarithms relate to exponentials?",
-        # Calculus
-        "What is the definition of a derivative?",
-        "Explain the chain rule for differentiation.",
-        "What is the fundamental theorem of calculus?",
-        "How do you compute the area under a curve?",
-        "What is L'Hôpital's rule and when is it used?",
-        # Number theory
-        "State and prove Euclid's theorem on the infinitude of primes.",
-        "What is the Euclidean algorithm for finding GCD?",
-        "Explain Fermat's little theorem.",
-        "What are perfect numbers? Give an example.",
-        "How does the sieve of Eratosthenes work?",
-        # Proofs
-        "Prove that the sum of the first n natural numbers is n(n+1)/2.",
-        "Prove by induction that 2^n > n for all positive integers n.",
-        "What is a proof by contradiction? Give an example.",
-        "Prove that there are infinitely many prime numbers.",
-        "What is mathematical induction and how does it work?",
-    ]
+    templates = MATH_CURRICULUM * (n // len(MATH_CURRICULUM) + 1)
+    templates = templates[:n]
 
     with open(output_path, "w", encoding="utf-8") as f:
-        count = 0
-        while count < n:
-            for template in templates:
-                if count >= n:
-                    break
-                f.write(json.dumps({"prompt": template}) + "\n")
-                count += 1
+        for template in templates:
+            f.write(json.dumps({"prompt": template}) + "\n")
 
-    print(f"Generated {count} math prompts → {output_path}")
+    print(f"Generated {len(templates)} math prompts → {output_path}")
 
 
 if __name__ == "__main__":
-    print("=== distill.py utility test (no model load) ===\n")
+    print("=== distill.py test (Ollama connection check) ===\n")
 
-    # Test prompt reading
-    import tempfile, os
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        models = [m["name"] for m in r.json().get("models", [])]
+        print(f"Ollama running. Models available: {models}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        prompts_path = os.path.join(tmpdir, "test_prompts.jsonl")
-        with open(prompts_path, "w") as f:
-            f.write(json.dumps({"prompt": "What is the derivative of x squared?"}) + "\n")
-            f.write(json.dumps({"prompt": "Prove the Pythagorean theorem."}) + "\n")
-            f.write(json.dumps({"text": "Explain Euclidean geometry."}) + "\n")
-            f.write('"What is a prime number?"\n')
+        # Quick generation test
+        result = generate_ollama(
+            prompt      = "What is 2 + 2? Think step by step.",
+            model       = "deepseek-r1:1.5b",
+            temperature = 0.7,
+            max_tokens  = 100,
+        )
+        print(f"\nTest generation:\n{result[:200]}")
 
-        prompts = list(read_prompts(prompts_path))
-        print(f"Read {len(prompts)} prompts:")
-        for p in prompts:
-            print(f"  - {p}")
+        reasoning = extract_reasoning(result)
+        score     = score_completion(reasoning)
+        print(f"\nExtracted reasoning score: {score:+.3f}")
 
-        # Test reward scoring
-        print("\nReward scoring test:")
-        test_completions = [
-            "The derivative of x squared is 2x. We apply the power rule: "
-            "bring down the exponent and reduce it by one.",
-            "banana banana banana banana banana banana banana banana banana",
-            "The proof proceeds by contradiction. Assume there are finitely "
-            "many primes. Multiply them all together and add one.",
-        ]
-        for text in test_completions:
-            score = score_completion(text)
-            routing = "positive" if score > 0.0 else "contrastive"
-            print(f"  score={score:+.3f}  [{routing}]  {text[:50]}...")
-
-        print("\n(Full distillation requires transformers + bitsandbytes + GPU)")
-        print("Install: pip install transformers bitsandbytes accelerate")
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Make sure Ollama is running: ollama serve")
