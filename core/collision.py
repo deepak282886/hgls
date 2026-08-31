@@ -11,10 +11,12 @@ If possible — MCTS navigates A → B within the activated subgraph.
 If it finds a high-reward path — the connection is real, an edge forms.
 Bellman delta propagates. The graph learned this connection.
 
-Sampling distribution:
-    70%  same-level pairs     (most productive)
-    20%  adjacent-level pairs (hierarchical connections)
-    10%  cross-level pairs    (exploration — mostly killed by checker)
+Sampling distribution across levels:
+    AXIOM    × AXIOM    : 3.0× weight  (most valuable — foundational connections)
+    SENTENCE × SENTENCE : 2.0× weight  (reasoning chain connections)
+    WORD     × WORD     : 0.5× weight  (lexical co-occurrence)
+    CHARACTER× CHARACTER: 0.1× weight  (structural patterns, rarely productive)
+    Cross-level pairs use the geometric mean of both level weights.
 
 Nodes are sampled with V-weighted probability — high-V nodes are more
 likely to form meaningful new connections because they already lead
@@ -55,11 +57,16 @@ ADJACENT_LEVEL_PROB = 0.20
 # Pool size for V-weighted sampling — top N nodes per level
 SAMPLE_POOL_SIZE = 5000
 
-# Levels eligible for collision sampling.
-# Restricted to SENTENCE only until CHARACTER and WORD nodes
-# are populated — PARAGRAPH and DOCUMENT nodes produce subgraphs
-# too large for MCTS to navigate in reasonable time.
-COLLISION_LEVELS = {Level.SENTENCE}
+# Level collision weights — controls how often each level is sampled.
+# AXIOM nodes form the most valuable connections (foundational structure).
+# SENTENCE nodes form reasoning chain connections.
+# WORD and CHARACTER are lower priority but still eligible.
+LEVEL_COLLISION_WEIGHTS = {
+    Level.AXIOM     : 3.0,
+    Level.SENTENCE  : 2.0,
+    Level.WORD      : 0.5,
+    Level.CHARACTER : 0.1,
+}
 
 # Minimum V value for a node to enter the sampling pool
 # — set well below the graph's average V so most nodes are included
@@ -212,12 +219,36 @@ class SamplingPool:
         return pool[idx]
 
     def available_levels(self) -> list[Level]:
-        """Levels with at least one node in their pool, restricted to COLLISION_LEVELS."""
+        """
+        Levels with at least 2 nodes in their pool.
+        All four levels are eligible — weighted by LEVEL_COLLISION_WEIGHTS.
+        """
         return [
             lv for lv in Level
-            if lv in COLLISION_LEVELS
-            and len(self.pools.get(lv, [])) >= 2
+            if len(self.pools.get(lv, [])) >= 2
         ]
+
+    def available_levels_weighted(self) -> tuple[list[Level], list[float]]:
+        """
+        Returns (levels, weights) for weighted level sampling.
+        Weight = LEVEL_COLLISION_WEIGHTS[level] × pool_size_fraction.
+        """
+        available = self.available_levels()
+        if not available:
+            return [], []
+
+        raw_weights = []
+        for lv in available:
+            pool_size   = len(self.pools.get(lv, []))
+            level_weight = LEVEL_COLLISION_WEIGHTS.get(lv, 1.0)
+            raw_weights.append(level_weight * min(1.0, pool_size / 100.0))
+
+        total = sum(raw_weights)
+        if total < 1e-9:
+            return available, [1.0 / len(available)] * len(available)
+
+        norm_weights = [w / total for w in raw_weights]
+        return available, norm_weights
 
 
 # ─────────────────────────────────────────────
@@ -226,62 +257,57 @@ class SamplingPool:
 
 def sample_pair(pool: SamplingPool) -> Optional[tuple[Node, Node]]:
     """
-    Sample (node_a, node_b) according to the distribution:
-        70%  same level
-        20%  adjacent levels (one step apart)
-        10%  cross levels (two steps apart, within checker limit)
+    Sample (node_a, node_b) for a collision attempt.
 
-    Only samples from levels that actually have nodes in their pool.
+    Level selection is weighted by LEVEL_COLLISION_WEIGHTS ×
+    pool size. AXIOM nodes are 3× more likely than SENTENCE,
+    6× more likely than WORD, 30× more likely than CHARACTER.
+
+    Within the level distribution:
+        70%  same level
+        20%  adjacent level (one step apart in hierarchy)
+        10%  cross level (two steps apart)
+
     Returns None if the pool is too sparse.
     """
-    available = pool.available_levels()
+    available, level_weights = pool.available_levels_weighted()
     if not available:
         return None
 
     roll = random.random()
 
+    # Select level_a by weighted sampling
+    r     = random.random()
+    cumul = 0.0
+    level_a = available[0]
+    for lv, w in zip(available, level_weights):
+        cumul += w
+        if r <= cumul:
+            level_a = lv
+            break
+
     if roll < SAME_LEVEL_PROB:
-        # Same level — pick from available levels weighted by pool size
-        weights = [len(pool.pools.get(lv, [])) for lv in available]
-        total   = sum(weights)
-        if total == 0:
-            return None
-        probs  = [w / total for w in weights]
-        level  = available[np.random.choice(len(available), p=probs)]
-        a = pool.sample_from_level(level)
-        b = pool.sample_from_level(level)
+        # Same level — both nodes from level_a
+        level_b = level_a
 
     elif roll < SAME_LEVEL_PROB + ADJACENT_LEVEL_PROB:
-        # Adjacent levels
-        if len(available) < 2:
-            level = available[0]
-            a = pool.sample_from_level(level)
-            b = pool.sample_from_level(level)
-        else:
-            level_a = random.choice(available)
-            adjacent = [
-                lv for lv in available
-                if abs(int(lv) - int(level_a)) == 1
-            ]
-            level_b = random.choice(adjacent) if adjacent else level_a
-            a = pool.sample_from_level(level_a)
-            b = pool.sample_from_level(level_b)
+        # Adjacent level — one step apart in hierarchy
+        adjacent = [
+            lv for lv in available
+            if abs(int(lv) - int(level_a)) == 1
+        ]
+        level_b = random.choice(adjacent) if adjacent else level_a
 
     else:
-        # Cross level (2 steps apart)
-        if len(available) < 2:
-            level = available[0]
-            a = pool.sample_from_level(level)
-            b = pool.sample_from_level(level)
-        else:
-            level_a = random.choice(available)
-            cross = [
-                lv for lv in available
-                if abs(int(lv) - int(level_a)) == 2
-            ]
-            level_b = random.choice(cross) if cross else level_a
-            a = pool.sample_from_level(level_a)
-            b = pool.sample_from_level(level_b)
+        # Cross level — two steps apart
+        cross = [
+            lv for lv in available
+            if abs(int(lv) - int(level_a)) == 2
+        ]
+        level_b = random.choice(cross) if cross else level_a
+
+    a = pool.sample_from_level(level_a)
+    b = pool.sample_from_level(level_b)
 
     if a is None or b is None:
         return None
@@ -437,6 +463,9 @@ class CollisionLoop:
                   f"{gs['edge_count']} edges")
             print(f"  Max iter: {'∞' if max_iter == 0 else max_iter}")
             print(f"  Commandments: {len(self.checker.commandments)}")
+            print(f"  Level weights: "
+                  + "  ".join(f"{lv.name}={w}"
+                              for lv, w in LEVEL_COLLISION_WEIGHTS.items()))
             print(f"\nPress Ctrl+C to stop.\n")
 
         iteration = 0

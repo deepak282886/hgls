@@ -4,34 +4,33 @@ activation.py
 Activation — the mechanism by which a query lights a neighborhood
 of the graph, defining the search space for MCTS traversal.
 
-A query arrives in any form — text, a node ID, or a set of
-seed nodes. Activation spreads from the query through the graph
-along edges, weighted by:
+A query arrives as text. Activation works in two stages:
 
-    - Embedding similarity (how similar is this node to the query)
-    - Edge reward (how strong is the connection)
-    - Distance decay (activation weakens with each hop)
-
-The result is a lit subgraph — a subset of nodes with activation
-values above a threshold. MCTS operates only within this subgraph.
-Unlit nodes do not exist for this query.
-
-Two spreading strategies:
-
-    1. SIMILARITY SPREAD
-       From query embedding, compute similarity to all nodes
-       in a candidate pool. Nodes above threshold are lit.
-       Fast but requires comparing against many embeddings.
+    1. KEYWORD SEEDING
+       Extract meaningful keywords from the query.
+       Search the graph for nodes at every level whose text
+       contains those keywords, ordered by V value.
+       The graph's own value landscape picks the best entry points.
+       AXIOM nodes are searched first — they are foundational
+       and connect to the most downstream content.
 
     2. EDGE SPREAD (BFS-based)
-       From seed node(s), spread activation along edges for
+       From seed nodes, spread activation along edges for
        N hops, decaying with distance. Naturally follows the
        causal structure of the graph.
 
-In practice: similarity spread identifies seed nodes,
-then edge spread expands the neighborhood from those seeds.
+This is correct for the architecture:
+    The query activates nodes that literally contain the query's
+    concepts at every level of the hierarchy. AXIOM nodes for
+    the relevant domain light up first. Edge spread then lights
+    everything connected to those axioms. MCTS navigates within
+    this subgraph, sequencing axioms toward the answer.
+
+    No embedding similarity needed — the graph's edge structure
+    and V values already encode what is relevant to what.
 """
 
+import re
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,7 +38,7 @@ from collections import deque
 
 from core.atoms  import Level, EMBEDDING_DIM
 from core.graph  import Graph
-from core.node   import Node, similarity
+from core.node   import Node
 
 
 # ─────────────────────────────────────────────
@@ -106,83 +105,6 @@ class ActivationResult:
             f"seeds={self.seeds}, "
             f"level={self.level})"
         )
-
-
-# ─────────────────────────────────────────────
-# QUERY EMBEDDING
-# ─────────────────────────────────────────────
-
-def embed_query(query_text: str, level: Level) -> np.ndarray:
-    """
-    Compute embedding for a query string at a given level.
-    Uses the same embedding function as node.py — same space,
-    so similarity is meaningful.
-    """
-    from core.node import compute_embedding
-    return compute_embedding(query_text, level)
-
-
-# ─────────────────────────────────────────────
-# SIMILARITY SPREAD
-# Fast top-K similarity search over candidate nodes
-# ─────────────────────────────────────────────
-
-def similarity_spread(
-    query_emb  : np.ndarray,
-    graph      : Graph,
-    level      : Optional[Level] = None,
-    top_k      : int = 20,
-    threshold  : float = ACTIVATION_THRESHOLD,
-) -> dict[int, float]:
-    """
-    Compute cosine similarity between query_emb and all nodes
-    at the given level (or all levels if None).
-
-    Returns dict of node_id → activation for nodes above threshold.
-
-    For large graphs this is the expensive step — comparing against
-    every node. In a production system this would use an ANN index
-    (e.g. FAISS). For now: exact search over batches from DB.
-    """
-    activations = {}
-
-    levels = [level] if level is not None else list(Level)
-
-    for lv in levels:
-        nodes = graph.nodes_by_level(lv, limit=10_000)
-
-        for node in nodes:
-            # Embeddings may differ in dim across levels
-            # — use the similarity function which handles this
-            qe = query_emb
-            ne = node.embedding
-
-            # Align dimensions
-            if qe.shape != ne.shape:
-                max_dim = max(len(qe), len(ne))
-                tmp_q   = np.zeros(max_dim, dtype=np.float32)
-                tmp_n   = np.zeros(max_dim, dtype=np.float32)
-                tmp_q[:len(qe)] = qe
-                tmp_n[:len(ne)] = ne
-                sim = float(np.dot(tmp_q, tmp_n))
-            else:
-                sim = float(np.dot(qe, ne))
-
-            sim = max(-1.0, min(1.0, sim))
-
-            # Map similarity [-1,1] → activation [0,1]
-            activation = (sim + 1.0) / 2.0
-
-            if activation >= threshold:
-                activations[node.node_id] = activation
-
-    # Keep top_k by activation value
-    if len(activations) > top_k:
-        sorted_items = sorted(activations.items(),
-                              key=lambda x: x[1], reverse=True)
-        activations  = dict(sorted_items[:top_k])
-
-    return activations
 
 
 # ─────────────────────────────────────────────
@@ -320,12 +242,8 @@ def normalize_activation(
 def _extract_keywords(query: str, max_keywords: int = 8) -> list[str]:
     """
     Extract meaningful keywords from a query string.
-
-    Filters out stop words and very short tokens.
-    Returns the most distinctive terms — longer words first,
-    since "derivative" is more distinctive than "the".
+    Filters stop words. Returns longer words first — more distinctive.
     """
-    import re
     STOP_WORDS = {
         'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been',
         'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
@@ -337,11 +255,21 @@ def _extract_keywords(query: str, max_keywords: int = 8) -> list[str]:
         'which', 'who', 'how', 'when', 'where', 'why', 'show',
         'prove', 'find', 'let', 'give', 'take', 'make', 'get',
     }
-    tokens = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+    tokens   = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
     keywords = [t for t in tokens if t not in STOP_WORDS]
-    # Sort by length descending — longer = more distinctive
     keywords = sorted(set(keywords), key=len, reverse=True)
     return keywords[:max_keywords]
+
+
+# Search priority per level — AXIOM first since it is
+# the most load-bearing level. SENTENCE next. WORD for
+# exact single-word matches. CHARACTER not useful for
+# keyword search (single chars match everything).
+_SEARCH_LEVELS = [
+    (Level.AXIOM,    2.0),   # (level, priority_weight)
+    (Level.SENTENCE, 1.0),
+    (Level.WORD,     0.5),
+]
 
 
 def activate(
@@ -358,57 +286,60 @@ def activate(
 
     Given a query string:
     1. Extract keywords from the query
-    2. Find seed nodes via SQLite text search (keyword matching)
-       Seeds are nodes whose text contains the query keywords,
-       ordered by V — the graph's own value landscape picks
-       the best entry points, not embedding similarity.
-    3. Spread activation from seeds along edges
-    4. Trim and normalize the lit subgraph
-    5. Return ActivationResult
+    2. Search all meaningful levels for nodes containing keywords
+       — AXIOM nodes have 2× priority weight because they are
+         foundational and connect to the most downstream content
+       — SENTENCE nodes next
+       — WORD nodes for exact word matches
+    3. Weight seeds by: level_priority × keyword_rank × node_V
+    4. Spread activation from seeds along edges
+    5. Trim and normalize the lit subgraph
 
-    This is correct for the architecture: the graph was shaped by
-    reward and co-occurrence. The query activates nodes that literally
-    contain the query's concepts, then the V landscape and edges
-    guide what gets lit up from there. No embedding similarity needed.
+    With an axiom-structured graph:
+    The relevant axioms for the query domain light up first.
+    Edge spread then lights everything connected to those axioms.
+    MCTS navigates this subgraph, sequencing axioms toward the answer.
+    Understanding and generation happen in one traversal.
     """
     if not query.strip():
         return ActivationResult(lit={}, seeds=[], query=None, level=level)
 
     primary_level = level if level is not None else Level.SENTENCE
 
-    # 1. Extract keywords from query
+    # 1. Extract keywords
     keywords = _extract_keywords(query)
-
     if not keywords:
         return ActivationResult(lit={}, seeds=[], query=None, level=primary_level)
 
-    # 2. Find seed nodes by keyword text match
-    # Each keyword contributes seeds — initial activation weighted
-    # by keyword position (earlier = more distinctive)
+    # 2. Search all meaningful levels for seeds
     seed_activations: dict[int, float] = {}
-    seeds_per_keyword = max(2, top_k_seeds // len(keywords))
+    seeds_per_keyword = max(2, top_k_seeds // max(1, len(keywords)))
+
+    # If a specific level was requested, only search that level
+    # (plus AXIOM which is always searched)
+    if level is not None and level != Level.AXIOM:
+        search_levels = [(Level.AXIOM, 2.0), (level, 1.0)]
+    else:
+        search_levels = _SEARCH_LEVELS
 
     for rank, keyword in enumerate(keywords):
-        # Weight decays slightly for lower-ranked keywords
         keyword_weight = 1.0 / (1.0 + rank * 0.2)
 
-        matches = graph.search_nodes_by_keyword(
-            keyword, primary_level,
-            limit = seeds_per_keyword,
-        )
+        for search_level, level_priority in search_levels:
+            matches = graph.search_nodes_by_keyword(
+                keyword, search_level,
+                limit = seeds_per_keyword,
+            )
+            for node in matches:
+                nid      = node.node_id
+                v_weight = max(0.1, (node.norm_V + 1.0) / 2.0)
+                act      = keyword_weight * level_priority * v_weight
 
-        for node in matches:
-            nid = node.node_id
-            # Combine: keyword weight × normalized V
-            # norm_V is in [0,1] — higher V nodes seed stronger
-            v_weight = max(0.1, (node.norm_V + 1.0) / 2.0)
-            activation = keyword_weight * v_weight
-
-            if nid in seed_activations:
-                # Node matched multiple keywords — boost it
-                seed_activations[nid] = min(1.0, seed_activations[nid] + activation * 0.5)
-            else:
-                seed_activations[nid] = activation
+                if nid in seed_activations:
+                    # Node matched multiple keywords or levels — boost
+                    seed_activations[nid] = min(2.0, seed_activations[nid] + act * 0.5)
+                else:
+                    seed_activations[nid] = act
 
     if not seed_activations:
         return ActivationResult(
@@ -437,7 +368,7 @@ def activate(
     return ActivationResult(
         lit   = norm_acts,
         seeds = seed_ids,
-        query = None,      # no embedding query in this architecture
+        query = None,
         level = primary_level,
     )
 
@@ -476,94 +407,6 @@ def activate_from_node(
         seeds = [node_id],
         query = node.embedding,
         level = node.level,
-    )
-
-
-# ─────────────────────────────────────────────
-# ACTIVATE FROM PATH
-# Multi-seed activation from a phase-1 understanding path
-# ─────────────────────────────────────────────
-
-def activate_from_path(
-    path       : list[int],
-    graph      : Graph,
-    max_hops   : int   = MAX_HOPS + 2,   # broader than single-node spread
-    threshold  : float = ACTIVATION_THRESHOLD,
-    max_nodes  : int   = MAX_LIT_NODES,
-) -> ActivationResult:
-    """
-    Activate from a list of node IDs representing a phase-1
-    understanding path.
-
-    Every node in the path is a seed. Initial activation is
-    weighted by two factors combined:
-        - Position in path: later nodes (closer to where
-          comprehension landed) seed stronger than earlier ones.
-        - Node reward: higher-reward nodes in the path
-          seed stronger than low-reward ones.
-
-    This produces a subgraph shaped by the understanding —
-    the generation space is not the raw query neighbourhood
-    but the neighbourhood of what the system already determined
-    is relevant.
-
-    max_hops is intentionally larger than single-node spread
-    because the generation subgraph should be broader than
-    the understanding subgraph — the answer may live further
-    out from the comprehension endpoint than the query did.
-    """
-    if not path:
-        return ActivationResult(lit={}, seeds=[], query=None, level=None)
-
-    # Collect valid nodes from path
-    path_nodes = []
-    for nid in path:
-        node = graph.get_node(nid)
-        if node is not None:
-            path_nodes.append((nid, node))
-
-    if not path_nodes:
-        return ActivationResult(lit={}, seeds=[], query=None, level=None)
-
-    n = len(path_nodes)
-
-    # Compute initial activation weights per seed
-    # Position weight: linear ramp from 0.3 (start) to 1.0 (end)
-    # Reward weight: map raw reward to [0.1, 1.0] via sigmoid
-    initial: dict[int, float] = {}
-    for i, (nid, node) in enumerate(path_nodes):
-        position_weight = 0.3 + 0.7 * (i / max(1, n - 1))
-        reward_weight   = 0.1 + 0.9 * (
-            1.0 / (1.0 + np.exp(-node.reward / ACTIVATION_TEMPERATURE))
-        )
-        initial[nid] = position_weight * reward_weight
-
-    # Normalise initial weights to [0, 1]
-    max_init = max(initial.values())
-    if max_init > 1e-9:
-        initial = {k: v / max_init for k, v in initial.items()}
-
-    seed_ids = [nid for nid, _ in path_nodes]
-
-    full_acts = edge_spread(
-        seeds               = seed_ids,
-        graph               = graph,
-        max_hops            = max_hops,
-        threshold           = threshold,
-        initial_activations = initial,
-    )
-
-    norm_acts = normalize_activation(full_acts, max_nodes=max_nodes)
-
-    # Use the last node's embedding as the query embedding —
-    # it represents where comprehension ended
-    last_node = path_nodes[-1][1]
-
-    return ActivationResult(
-        lit   = norm_acts,
-        seeds = seed_ids,
-        query = last_node.embedding,
-        level = last_node.level,
     )
 
 

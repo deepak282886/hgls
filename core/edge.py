@@ -184,50 +184,42 @@ def _structural_validity(source_text: str, target_text: str, level: Level) -> fl
         CHARACTER: target is a valid character
         WORD:      target looks like a real word
         SENTENCE:  target is a complete sentence
-        PARAGRAPH: target is a coherent paragraph
+        AXIOM:     target is a well-formed foundational statement
     """
     if not target_text or not target_text.strip():
         return -1.0
 
     if level == Level.CHARACTER:
-        # Valid character transition — single printable character
         return 1.0 if len(target_text) == 1 and target_text.isprintable() else -1.0
 
     if level == Level.WORD:
-        # Valid word — no spaces, not empty, reasonable length
         stripped = target_text.strip()
         if not stripped or ' ' in stripped:
             return -0.5
-        if len(stripped) > 30:   # suspiciously long
+        if len(stripped) > 30:
             return -0.3
         return 1.0 if stripped.replace("'", "").replace("-", "").isalpha() else 0.3
 
     if level == Level.SENTENCE:
-        # Valid sentence — ends with punctuation, has multiple words
         stripped = target_text.strip()
         words = stripped.split()
         if len(words) < 2:
             return -0.5
         if stripped[-1] not in '.!?:':
-            return 0.2          # not ideal but not invalid
+            return 0.2
         if len(words) > 80:
-            return -0.2         # suspiciously long
+            return -0.2
         return 1.0
 
-    if level == Level.PARAGRAPH:
-        # Valid paragraph — multiple sentences, substantial content
+    if level == Level.AXIOM:
+        # Valid axiom — at least one complete sentence, formal language
         stripped = target_text.strip()
-        sentence_count = len(re.split(r'[.!?]+', stripped))
-        if sentence_count < 2:
-            return 0.3
-        if len(stripped) < 30:
-            return -0.3
-        return 1.0
-
-    if level == Level.DOCUMENT:
-        # Valid document — multiple paragraphs
-        paragraphs = [p for p in target_text.split('\n\n') if p.strip()]
-        return 1.0 if len(paragraphs) >= 2 else 0.5
+        if len(stripped) < 15:
+            return -0.5
+        words       = stripped.split()
+        has_content = len(words) >= 5
+        has_end     = stripped[-1] in '.!?'
+        return 1.0 if (has_content and has_end) else 0.4
 
     return 0.0
 
@@ -277,10 +269,8 @@ def compute_edge_reward(
         w_coh, w_nov, w_val = 0.3, 0.4, 0.3
     elif level == Level.SENTENCE:
         w_coh, w_nov, w_val = 0.4, 0.3, 0.3
-    elif level == Level.PARAGRAPH:
-        w_coh, w_nov, w_val = 0.5, 0.2, 0.3
-    else:  # DOCUMENT
-        w_coh, w_nov, w_val = 0.5, 0.2, 0.3
+    else:  # AXIOM — coherence is paramount for foundational connections
+        w_coh, w_nov, w_val = 0.6, 0.1, 0.3
 
     # Raw score in [-1, 1]
     # coherence: [0,1] → [-0.5, +0.5] (some coherence needed, too much = repetition)
@@ -402,25 +392,13 @@ def transition(source_text: str, level: Level,
         if not candidates:
             candidates = candidates_raw[:2]
 
-    elif level == Level.PARAGRAPH:
-        # Paragraph transitions — high-level causal continuation
-        if ctx:
-            prev = ctx[-1]
-            prev_words = _tokenize(prev)
-            src_words  = _tokenize(source_text)
-            shared = prev_words & src_words
-        else:
-            shared = set()
-
+    elif level == Level.AXIOM:
+        # Axiom transitions — logical dependencies and derivations
         candidates = [
-            "The evidence pointed toward a conclusion that had not been considered.",
-            "This development shifted the direction of the investigation entirely.",
-        ]
-
-    elif level == Level.DOCUMENT:
-        candidates = [
-            "The following section examines the implications in greater detail.",
-            "A new perspective emerged from the preceding analysis.",
+            "This follows directly from the preceding axiom by substitution.",
+            "Applying the above rule to the general case gives the following result.",
+            "The combination of these two foundational principles implies the theorem.",
+            "From this definition we derive the first consequence.",
         ]
 
     return candidates

@@ -24,7 +24,7 @@ import numpy as np
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from core.atoms import Level, EMBEDDING_DIM, REWARD_SCALE, text_to_characters, char_to_id
+from core.atoms import Level, EMBEDDING_DIM, REWARD_SCALE, text_to_characters, text_to_sentences, char_to_id
 import hashlib
 import re
 
@@ -276,78 +276,63 @@ def compute_embedding(text: str, level: Level) -> np.ndarray:
 
         emb = acc
 
-    elif level == Level.PARAGRAPH:
+    elif level == Level.AXIOM:
         # dim=256
-        sentences = [s.strip() for s in text.replace('!', '.').replace('?', '.').split('.') if s.strip()]
-        ns = len(sentences)
-        words  = text.split()
-        nw     = len(words)
+        # Axioms are dense with technical vocabulary and logical structure.
+        # Word feature hashing like SENTENCE but with 230 hash dims
+        # and 26 structural dims tuned for formal logical content.
 
-        # Character frequency (first 64 dims)
-        freq = np.zeros(97, dtype=np.float32)
-        for cid in ids:
-            if cid < 97:
-                freq[cid] += 1
-        freq /= (n + 1e-9)
-        emb[:64] = freq[:64]
+        raw_words        = re.findall(r'\b\w+\b', text.lower())
+        words_meaningful = [w for w in raw_words if len(w) >= 2]
+        HASH_DIMS        = 230
 
-        # Structural features
-        emb[64] = min(ns, 20) / 20.0              # sentence count
-        emb[65] = min(nw, 200) / 200.0            # word count
-        emb[66] = min(n, 1500) / 1500.0           # char count
-        emb[67] = len(set(w.lower() for w in words)) / (nw + 1e-9)  # lexical diversity
-        emb[68] = text.count('?') / (ns + 1e-9)  # question density
-        emb[69] = text.count(',') / (nw + 1e-9)  # comma density (clause complexity)
-        emb[70] = text.count('"') / (n + 1e-9)   # quote presence
-        emb[71] = float(any(c.isdigit() for c in text))  # contains numbers
+        acc = np.zeros(dim, dtype=np.float32)
 
-        # Sentence length variance — measures structural regularity
-        if sentences:
-            slens = [len(s.split()) for s in sentences]
-            emb[72] = np.std(slens) / (np.mean(slens) + 1e-9)
+        if words_meaningful:
+            weight = 1.0 / len(words_meaningful)
+            for word in words_meaningful:
+                for salt in range(3):
+                    h    = hashlib.md5(f"{word}_{salt}".encode()).digest()
+                    pos  = int.from_bytes(h[:4], 'big') % HASH_DIMS
+                    sign = 1.0 if h[4] % 2 == 0 else -1.0
+                    acc[pos] += sign * weight
 
-        # Positional encoding over characters (dims 73-255)
-        step = max(1, n // (dim - 73))
-        for k, pos in enumerate(range(0, n, step)):
-            slot = 73 + k
-            if slot >= dim:
-                break
-            cid = ids[pos] if pos < len(ids) else 0
-            emb[slot] = np.sin(cid / 97.0 * np.pi) * np.cos(pos / (n + 1e-9) * np.pi)
+        words_all = text.split()
+        nw        = len(words_all)
+        sentences = text_to_sentences(text) if text else []
+        ns        = len(sentences)
 
-    elif level == Level.DOCUMENT:
-        # dim=512
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        np_ = len(paragraphs)
-        words = text.split()
-        nw    = len(words)
+        # Structural features in last 26 dims
+        acc[230] = min(nw, 100) / 100.0                                    # word count
+        acc[231] = min(n,  500) / 500.0                                    # char count
+        acc[232] = min(ns, 10)  / 10.0                                     # sentence count
+        acc[233] = (len(set(w.lower() for w in words_all)) /
+                    (nw + 1e-9))                                            # lexical diversity
+        acc[234] = sum(c.isdigit() for c in text) / (n + 1e-9)            # digit ratio
+        acc[235] = sum(1 for c in text if c in '∫∂∑∏√±≈≠≤≥∀∃¬') / (n + 1e-9)  # logic/math symbols
+        acc[236] = text.count('$') / (n + 1e-9)                           # LaTeX
+        acc[237] = text.count('→') / (n + 1e-9)                           # implication arrows
+        acc[238] = float('for all' in text.lower() or '∀' in text)        # universal quantifier
+        acc[239] = float('there exists' in text.lower() or '∃' in text)   # existential quantifier
+        acc[240] = float('if' in text.lower() and 'then' in text.lower())  # conditional structure
+        acc[241] = float('therefore' in text.lower() or 'hence' in text.lower())  # conclusion marker
+        acc[242] = float('proof' in text.lower() or 'lemma' in text.lower())     # proof language
+        acc[243] = (sum(1 for w in words_meaningful if len(w) > 8) /
+                    (len(words_meaningful) + 1e-9))                        # technical word ratio
+        acc[244] = float('axiom' in text.lower() or 'postulate' in text.lower())  # self-referential
+        acc[245] = float('define' in text.lower() or 'definition' in text.lower())  # definitional
+        acc[246] = float('rule' in text.lower() or 'law' in text.lower())           # rule language
+        acc[247] = float('procedure' in text.lower() or 'algorithm' in text.lower())  # procedural
+        acc[248] = text.count(':') / (n + 1e-9)                           # colon (formal definition)
+        acc[249] = text.count('=') / (n + 1e-9)                           # equality
+        acc[250] = text.count('(') / (n + 1e-9)                           # parenthetical structure
+        acc[251] = float(text.strip()[-1] == '.') if text.strip() else 0  # declarative end
+        acc[252] = float(nw > 5 and nw < 50)                              # concise (typical axiom)
+        acc[253] = float(ns == 1)                                          # single sentence (atomic)
+        acc[254] = float(ns > 1)                                           # multi-sentence
+        acc[255] = float(text[0].isupper()) if text else 0.0              # proper start
 
-        # Character frequency (first 97 dims — full vocab)
-        freq = np.zeros(97, dtype=np.float32)
-        for cid in ids:
-            if cid < 97:
-                freq[cid] += 1
-        freq /= (n + 1e-9)
-        emb[:97] = freq
-
-        # High-level structural features
-        emb[97]  = min(np_, 50)  / 50.0
-        emb[98]  = min(nw,  5000) / 5000.0
-        emb[99]  = min(n,   30000) / 30000.0
-        emb[100] = len(set(w.lower() for w in words)) / (nw + 1e-9)
-        emb[101] = text.count('\n') / (n + 1e-9)
-        emb[102] = text.count('?') / (nw + 1e-9)
-        emb[103] = text.count('!') / (nw + 1e-9)
-        emb[104] = text.count('"') / (nw + 1e-9)
-
-        # Positional encoding over sampled characters (dims 105-511)
-        step = max(1, n // (dim - 105))
-        for k, pos in enumerate(range(0, n, step)):
-            slot = 105 + k
-            if slot >= dim:
-                break
-            cid = ids[pos] if pos < len(ids) else 0
-            emb[slot] = np.sin(cid / 97.0 * np.pi) * np.cos(pos / (n + 1e-9) * np.pi)
+        emb = acc
 
     # L2 normalize so all embeddings live on the unit hypersphere
     # This makes cosine similarity = dot product everywhere
@@ -418,9 +403,9 @@ if __name__ == "__main__":
 
     samples = [
         ("a",                                      Level.CHARACTER),
-        ("Detective",                              Level.WORD),
-        ("She found footprints leading to the back room.", Level.SENTENCE),
-        ("The building smelled of rust and old machinery.\nShe found footprints.", Level.PARAGRAPH),
+        ("derivative",                             Level.WORD),
+        ("The derivative of x squared is 2x by the power rule.", Level.SENTENCE),
+        ("For any function x^n, the derivative is n times x^(n-1). This follows from the limit definition.", Level.AXIOM),
     ]
 
     nodes = []

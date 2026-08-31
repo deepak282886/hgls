@@ -60,8 +60,7 @@ LENGTH_BOUNDS = {
     Level.CHARACTER : (1,   10),
     Level.WORD      : (1,   80),
     Level.SENTENCE  : (10,  1000),
-    Level.PARAGRAPH : (30,  5000),
-    Level.DOCUMENT  : (100, 100_000),
+    Level.AXIOM     : (15,  2000),
 }
 
 # Level pairs that are incompatible for collision
@@ -154,7 +153,7 @@ def _check_structural(node: Node) -> CheckResult:
                                   f"{ratio:.0%} of text")
 
     # Single word repeated excessively (word level and above)
-    if level in (Level.SENTENCE, Level.PARAGRAPH, Level.DOCUMENT):
+    if level in (Level.SENTENCE, Level.AXIOM):
         words = re.findall(r'\b\w+\b', stripped.lower())
         if words:
             from collections import Counter
@@ -166,7 +165,7 @@ def _check_structural(node: Node) -> CheckResult:
 
     # All-caps noise: short strings that are fully uppercase
     # but not a plausible acronym (< 6 chars are allowed as acronyms)
-    if level in (Level.SENTENCE, Level.PARAGRAPH) and n > 20:
+    if level in (Level.SENTENCE, Level.AXIOM) and n > 20:
         alpha_chars = [c for c in stripped if c.isalpha()]
         if alpha_chars:
             upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
@@ -188,7 +187,7 @@ def _check_level_pair(node_a: Node, node_b: Node) -> CheckResult:
     if gap >= INCOMPATIBLE_LEVEL_GAP:
         return _killed(1, f"incompatible level pair: "
                           f"{node_a.level.name} ↔ {node_b.level.name} "
-                          f"(gap={gap})")
+                          f"(gap={gap}, max allowed={INCOMPATIBLE_LEVEL_GAP-1})")
     return PASSED
 
 

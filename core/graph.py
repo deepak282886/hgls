@@ -269,9 +269,70 @@ class Graph:
         return node
 
 
-    # ─────────────────────────────────────────
-    # ADD EDGE
-    # ─────────────────────────────────────────
+    def add_nodes_batch(self, nodes_data: list[tuple]) -> list[int]:
+        """
+        Insert multiple nodes in a single transaction.
+        Dramatically faster than calling add_node() in a loop.
+
+        nodes_data: list of (text, level, reward) tuples
+
+        Returns list of node_ids in the same order as input.
+        Skips nodes whose text already exists at that level.
+        """
+        if not nodes_data:
+            return []
+
+        node_ids = []
+        rows     = []
+        nodes    = []
+
+        for text, level, reward in nodes_data:
+            # Check for existing node
+            existing = self.text_exists(text, level)
+            if existing is not None:
+                node_ids.append(existing)
+                continue
+
+            nid  = self._next_node_id
+            node = make_node(nid, text, level, reward)
+            d    = node.to_dict()
+            rows.append((
+                d["node_id"], d["text"], d["level"], d["embedding"],
+                d["reward"], d["norm_reward"], d["V"], d["norm_V"],
+                d["visit_count"], d["total_reward"], d["created_at"],
+                d["is_terminal"], d["children"], d["parents"],
+            ))
+            nodes.append(node)
+            node_ids.append(nid)
+            self._next_node_id += 1
+            self._node_count   += 1
+            self._welford_update(level, reward)
+
+        if rows:
+            self._conn.executemany("""
+                INSERT OR IGNORE INTO nodes
+                (node_id, text, level, embedding, reward, norm_reward,
+                 V, norm_V, visit_count, total_reward, created_at,
+                 is_terminal, children, parents)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, rows)
+
+            # Update counters once
+            self._save_counter("next_node_id", self._next_node_id)
+            self._save_counter("node_count",   self._node_count)
+
+            # Save level stats once per level
+            levels_seen = set(level for _, level, _ in nodes_data)
+            for level in levels_seen:
+                self._save_level_stats(level)
+
+            self._conn.commit()
+
+            # Cache all new nodes
+            for node in nodes:
+                self._node_cache.put(node.node_id, node)
+
+        return node_ids
 
     def add_edge(self, source_id: int, target_id: int,
                  source_text: str, target_text: str,
@@ -562,6 +623,80 @@ class Graph:
             (source_id, target_id)
         ).fetchone()
         return row is not None
+
+
+    def add_edges_batch(
+        self,
+        edges: list[tuple[int, int, str, str, "Level", "EdgeType"]],
+    ) -> int:
+        """
+        Insert multiple edges in a single transaction.
+        Dramatically faster than calling add_edge() in a loop.
+
+        edges: list of (source_id, target_id, source_text,
+                        target_text, level, edge_type)
+
+        Skips edges that already exist.
+        Returns number of edges actually inserted.
+        """
+        from core.edge import make_edge, EdgeType as ET
+
+        if not edges:
+            return 0
+
+        inserted   = 0
+        rows       = []
+        source_ids = set()
+
+        for source_id, target_id, source_text, target_text, level, edge_type in edges:
+            # Check existence in one query per pair — still needed for safety
+            # but we batch the inserts
+            if self.edge_exists(source_id, target_id):
+                continue
+
+            eid  = self._next_edge_id
+            edge = make_edge(eid, source_id, target_id,
+                             source_text, target_text, level, edge_type)
+            d = edge.to_dict()
+            rows.append((
+                d["edge_id"], d["source_id"], d["target_id"],
+                d["edge_type"], d["reward"], d["norm_reward"],
+                d["visit_count"], d["total_reward"], d["source_level"],
+            ))
+            self._next_edge_id += 1
+            self._edge_count   += 1
+            source_ids.add(source_id)
+            inserted += 1
+
+        if not rows:
+            return 0
+
+        # Single bulk insert
+        self._conn.executemany("""
+            INSERT OR IGNORE INTO edges
+            (edge_id, source_id, target_id, edge_type, reward,
+             norm_reward, visit_count, total_reward, source_level)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, rows)
+
+        # Mark all source nodes as non-terminal in one query
+        if source_ids:
+            placeholders = ",".join("?" * len(source_ids))
+            self._conn.execute(
+                f"UPDATE nodes SET is_terminal=0 WHERE node_id IN ({placeholders})",
+                list(source_ids),
+            )
+
+        # Update counters once
+        self._save_counter("next_edge_id", self._next_edge_id)
+        self._save_counter("edge_count",   self._edge_count)
+        self._conn.commit()
+
+        # Invalidate cache for source nodes
+        for sid in source_ids:
+            self._node_cache.invalidate(sid)
+
+        return inserted
 
 
     # ─────────────────────────────────────────

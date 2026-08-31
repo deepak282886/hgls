@@ -21,6 +21,13 @@ Two modes:
 Both modes operate within the lit subgraph from activation.py.
 Unlit nodes are invisible regardless of their V value.
 
+One MCTS is sufficient because the graph is axiom-structured.
+Axioms are the highest-V nodes. Activation lights the relevant
+axioms for the query. MCTS sequences them toward the answer.
+Understanding and generation happen in the same traversal —
+there is no need for a separate comprehension phase when the
+graph's foundational structure already encodes what is relevant.
+
 Traversal also handles:
     - Replay — re-run a known path ID sequence
     - Path rendering — convert node IDs to readable output
@@ -34,7 +41,7 @@ from typing      import Optional
 from core.atoms      import Level
 from core.graph      import Graph
 from core.node       import Node
-from core.activation import ActivationResult, activate, activate_from_node, activate_from_path
+from core.activation import ActivationResult, activate, activate_from_node
 from core.normalizer import Normalizer
 from core.mcts       import MCTS, MCTSResult
 
@@ -372,197 +379,6 @@ def traverse_from_node(
         max_depth  = max_depth,
         max_iter   = max_iter,
         max_hops   = max_hops,
-    )
-
-
-# ─────────────────────────────────────────────
-# TWO-PHASE RESULT
-# ─────────────────────────────────────────────
-
-@dataclass
-class TwoPhaseResult:
-    """
-    Output of a two-phase query — understanding then generation.
-
-    understanding : phase 1 — what the graph knows about the query.
-                    MCTS navigated from the query-activated subgraph.
-                    This path IS the comprehension.
-
-    generation    : phase 2 — the answer.
-                    MCTS navigated from the subgraph activated by
-                    the understanding path. This path IS the response.
-
-    total_elapsed : wall clock seconds for both phases combined.
-    """
-    understanding : TraversalResult
-    generation    : TraversalResult
-    total_elapsed : float
-
-    def summary(self) -> str:
-        return (
-            f"TwoPhaseResult("
-            f"understanding={len(self.understanding.path)} steps "
-            f"reward={self.understanding.total_reward:.3f} | "
-            f"generation={len(self.generation.path)} steps "
-            f"reward={self.generation.total_reward:.3f} | "
-            f"elapsed={self.total_elapsed:.4f}s)"
-        )
-
-    def __repr__(self) -> str:
-        return self.summary()
-
-
-# ─────────────────────────────────────────────
-# TWO-PHASE TRAVERSAL
-# ─────────────────────────────────────────────
-
-def traverse_two_phase(
-    query      : str,
-    graph      : Graph,
-    normalizer : Normalizer,
-    level      : Level         = Level.SENTENCE,
-    mode       : str           = "mcts",
-    max_depth  : int           = 50,
-    max_iter   : int           = 100,
-    max_hops   : int           = 6,
-) -> TwoPhaseResult:
-    """
-    Two-phase query: understanding then generation.
-
-    Phase 1 — Understanding
-        Activate from the raw query text.
-        MCTS searches the query-shaped subgraph.
-        The resulting path is the system's comprehension of
-        what was asked — which nodes, in which order, are
-        most relevant to the query.
-
-    Phase 2 — Generation
-        Activate from the understanding path using
-        activate_from_path(). The new subgraph is shaped by
-        what the system understood, not by the raw query text.
-        Later nodes in the understanding path seed stronger
-        because they represent where comprehension landed.
-        MCTS searches this knowledge-shaped subgraph.
-        The resulting path is the answer.
-
-    The start node for phase 2 is the last node of the
-    understanding path — generation continues forward from
-    where comprehension ended. If the last node produces an
-    empty activation (isolated node), the highest-V seed in
-    the phase 2 subgraph is used instead.
-
-    Falls back gracefully:
-        - Phase 1 empty  → returns two empty TraversalResults
-        - Phase 2 empty  → generation falls back to greedy from
-                           the phase 2 activation seeds
-    """
-    t0 = time.time()
-
-    # ── Phase 1: Understanding ───────────────
-    understanding = traverse(
-        query      = query,
-        graph      = graph,
-        normalizer = normalizer,
-        level      = level,
-        mode       = mode,
-        max_depth  = max_depth,
-        max_iter   = max_iter,
-        max_hops   = max_hops,
-    )
-
-    # If phase 1 found nothing, bail — no comprehension, no generation
-    if not understanding.path:
-        empty = TraversalResult(
-            path=[], texts=[], total_reward=0.0,
-            mode=mode, level=level,
-            elapsed=0.0,
-        )
-        return TwoPhaseResult(
-            understanding = understanding,
-            generation    = empty,
-            total_elapsed = round(time.time() - t0, 4),
-        )
-
-    # ── Phase 2: Generation ──────────────────
-    # Activate from the understanding path — broader spread
-    # (activate_from_path uses max_hops + 2 by default)
-    gen_activation = activate_from_path(
-        path      = understanding.path,
-        graph     = graph,
-        threshold = 0.03,           # slightly lower — cast wider net
-        max_nodes = 750,            # more nodes available for generation
-    )
-
-    if not gen_activation.lit:
-        empty = TraversalResult(
-            path=[], texts=[], total_reward=0.0,
-            mode=mode, level=level,
-            elapsed=0.0,
-        )
-        return TwoPhaseResult(
-            understanding = understanding,
-            generation    = empty,
-            total_elapsed = round(time.time() - t0, 4),
-        )
-
-    # Start generation from the endpoint of comprehension
-    gen_start = understanding.path[-1]
-
-    # If the comprehension endpoint is not in the gen subgraph,
-    # use the highest-V seed from the gen activation instead
-    if not gen_activation.is_lit(gen_start):
-        seed_vs = [
-            (sid, graph.get_node(sid).V if graph.get_node(sid) else 0.0)
-            for sid in gen_activation.seeds
-            if graph.get_node(sid) is not None
-        ]
-        if seed_vs:
-            gen_start = max(seed_vs, key=lambda x: x[1])[0]
-        else:
-            gen_start = next(iter(gen_activation.lit))
-
-    # Run MCTS (or greedy) within the generation subgraph
-    t_gen = time.time()
-    gen_mcts_result = None
-    gen_mode = mode
-
-    if mode == "greedy":
-        gen_path = greedy_traverse(gen_start, gen_activation, graph, max_depth)
-
-    elif mode == "mcts":
-        mcts = MCTS(graph, normalizer)
-        gen_mcts_result = mcts.search(
-            start_node_id = gen_start,
-            activation    = gen_activation,
-            max_iter      = max_iter,
-            max_depth     = max_depth,
-            level         = level,
-        )
-        gen_path = gen_mcts_result.best_path
-
-        if not gen_path:
-            gen_path = greedy_traverse(gen_start, gen_activation, graph, max_depth)
-            gen_mode = "greedy_fallback"
-    else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'greedy' or 'mcts'.")
-
-    gen_texts  = path_texts(gen_path, graph)
-    gen_reward = path_reward(gen_path, graph)
-
-    generation = TraversalResult(
-        path         = gen_path,
-        texts        = gen_texts,
-        total_reward = gen_reward,
-        mode         = gen_mode,
-        level        = level,
-        elapsed      = round(time.time() - t_gen, 4),
-        mcts_result  = gen_mcts_result,
-    )
-
-    return TwoPhaseResult(
-        understanding = understanding,
-        generation    = generation,
-        total_elapsed = round(time.time() - t0, 4),
     )
 
 

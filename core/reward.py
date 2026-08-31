@@ -54,8 +54,7 @@ MIN_TOKENS = {
     Level.CHARACTER : 1,
     Level.WORD      : 1,
     Level.SENTENCE  : 3,
-    Level.PARAGRAPH : 10,
-    Level.DOCUMENT  : 30,
+    Level.AXIOM     : 5,
 }
 
 # Contrastive margin — minimum gap between positive and negative reward
@@ -198,16 +197,22 @@ def _structural_score(text: str, level: Level) -> float:
             return 1.0
         return 0.6   # acceptable but not ideal
 
-    if level == Level.PARAGRAPH:
-        sentences = re.split(r'[.!?]+', stripped)
+    if level == Level.AXIOM:
+        # Axioms should be precise and complete
+        # Good axioms: formal language, contains defining/ruling vocabulary
+        axiom_markers = ['for all', 'there exists', 'if', 'then', 'therefore',
+                         'define', 'axiom', 'rule', 'must', 'always', 'never',
+                         'implies', 'equivalent', 'such that', 'holds', 'is defined']
+        has_marker = any(m in stripped.lower() for m in axiom_markers)
+        has_formal = bool(re.search(r'[=<>≤≥≠∈∉∀∃→↔¬∧∨]', stripped))
+        sentences  = re.split(r'[.!?]+', stripped)
         valid_sents = [s for s in sentences if len(s.split()) >= 3]
-        if len(valid_sents) < 2:
-            return 0.3
-        return min(1.0, len(valid_sents) / 5.0)
 
-    if level == Level.DOCUMENT:
-        paragraphs = [p for p in text.split('\n\n') if p.strip()]
-        return min(1.0, len(paragraphs) / 3.0)
+        score = 0.4  # base
+        if has_marker:  score += 0.25
+        if has_formal:  score += 0.20
+        if len(valid_sents) >= 1: score += 0.15
+        return min(1.0, score)
 
     return 0.5
 
