@@ -1,382 +1,215 @@
 """
 atoms.py
 
-Defines the atomic units of the architecture.
-Everything in the graph is built from these primitives upward.
+The absolute foundation. Three parameters. Core types. Nothing else.
 
-Hierarchy:
-    Level 0 — CHARACTER  : single characters — the irreducible primitive
-    Level 1 — WORD       : composites of characters — the complete lexicon
-    Level 2 — SENTENCE   : composites of words — complete thoughts
-    Level 3 — AXIOM      : single or multi-sentence foundational truths
-                           the load-bearing nodes from which everything
-                           else can be derived by sequencing
+Three parameters control everything:
+    BASE_DECAY              — how fast unused structure fades
+    COMPRESSION_THRESHOLD   — how much recurrence before a pattern becomes a node
+    BOUNDARY_SENSITIVITY    — how novel something must be to cross the membrane
 
-Why this hierarchy:
+Everything else in the system is derived from these three and from the data.
 
-    CHARACTER and WORD are finite and complete.
-    Ingest every character that exists. Ingest every word in the
-    dictionary. These two layers are not sampled — they are exhaustive.
-    This means the graph has complete coverage at the primitive level
-    before any reasoning begins.
+Node states:
+    provisional  — seen but not yet stable. in the provisional buffer.
+    stable       — well supported by observation. core graph.
+    hypothetical — generated top-down by projection. not yet observed.
+    decaying     — was stable, losing support. fading out.
 
-    SENTENCE is generated — frontier model produces sentences
-    systematically across every domain. Not exhaustive but broad.
-    Each sentence is a complete thought that connects word nodes
-    through co-occurrence.
-
-    AXIOM is the foundational layer — the load-bearing truths of
-    every domain. Mathematics, logic, computation, language, physical
-    reality. Axioms are what MCTS sequences through to derive answers.
-    A high-V axiom node is one from which many conclusions are reachable.
-
-Why PARAGRAPH and DOCUMENT were removed:
-
-    Paragraphs and documents were intermediate containers — useful for
-    ingesting raw text but not meaningful as reasoning units. They had
-    no foundational role. AXIOM replaces PARAGRAPH as Level 3 with a
-    fundamentally different purpose: not a container of sentences but
-    a primitive of reasoning.
-
-    DOCUMENT level is gone entirely. The graph is not a document store.
-    It is a reasoning engine. Documents decompose into sentences and
-    axioms during ingestion — they don't persist as nodes.
+Level:
+    Not pre-decided. Emerges from compression.
+    Level 0 = raw input tokens (primitives).
+    Level N = patterns of level N-1 nodes.
+    The system discovers how many levels it needs.
 """
 
-from enum import IntEnum
-import re
+import time
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 # ─────────────────────────────────────────────
-# HIERARCHY LEVELS
+# THREE PARAMETERS — the only knobs
 # ─────────────────────────────────────────────
 
-class Level(IntEnum):
-    CHARACTER = 0
-    WORD      = 1
-    SENTENCE  = 2
-    AXIOM     = 3
+BASE_DECAY            = 0.001   # per tick weight loss rate
+COMPRESSION_THRESHOLD = 0.7     # PMI threshold for compression
+BOUNDARY_SENSITIVITY  = 0.3     # novelty threshold for crossing membrane
 
 
 # ─────────────────────────────────────────────
-# EMBEDDING DIMENSIONS PER LEVEL
+# NODE STATE
+# ─────────────────────────────────────────────
+
+class State(str, Enum):
+    PROVISIONAL  = "provisional"
+    STABLE       = "stable"
+    HYPOTHETICAL = "hypothetical"
+    DECAYING     = "decaying"
+
+
+# ─────────────────────────────────────────────
+# DECAY RATE — derived from level
 #
-# CHARACTER: 16 dims — enough for positional and
-#   categorical distinction of 97 printable chars.
+# Higher level = slower decay.
+# Lower level  = faster decay.
+# Relearning a character costs nothing.
+# Relearning a schema costs a lot.
+# ─────────────────────────────────────────────
+
+def decay_rate(level: int) -> float:
+    """
+    Derive decay rate from level.
+    Level 0 (primitives) decay fastest — they are constantly reinforced.
+    Higher levels decay slower — they are harder to relearn.
+    """
+    return BASE_DECAY / (level + 1)
+
+
+# ─────────────────────────────────────────────
+# ACTIVATION BOOST — how much a visit restores weight
+# ─────────────────────────────────────────────
+
+ACTIVATION_BOOST = 0.1   # weight added on each activation
+
+
+# ─────────────────────────────────────────────
+# WEIGHT THRESHOLDS
+# ─────────────────────────────────────────────
+
+STABLE_THRESHOLD   = 0.5    # below this, stable → decaying
+DISSOLVE_THRESHOLD = 0.01   # below this, node dissolves
+ACTIVATION_MIN     = 0.05   # below this, node invisible to traversal
+
+
+# ─────────────────────────────────────────────
+# THINKING CONSTANTS
+# ─────────────────────────────────────────────
+
+MAX_ROLLOUT_DEPTH    = 20    # maximum steps in a single rollout
+MIN_CONFIDENCE       = 0.05  # stop rollout when confidence drops below this
+PARALLEL_ROLLOUTS    = 4     # number of simultaneous rollouts
+CONTEXT_WINDOW_SIZE  = 8     # how many recent nodes to keep in working memory
+
+
+# ─────────────────────────────────────────────
+# COMPRESSION CONSTANTS
+# ─────────────────────────────────────────────
+
+MIN_INSTANCES_FOR_SCHEMA = 3   # minimum instances before slot detection runs
+MIN_RECURRENCE           = 2   # minimum times a pattern must recur
+
+
+# ─────────────────────────────────────────────
+# PROVISIONAL BUFFER CONSTANTS
+# ─────────────────────────────────────────────
+
+PROVISIONAL_TTL = 3600.0   # seconds before unconfirmed provisional dissolves
+
+
+# ─────────────────────────────────────────────
+# SURFACE TEXT SENTINEL
 #
-# WORD: 64 dims — enough for morphological and
-#   distributional features of ~200k dictionary words.
+# Level 0 nodes store raw text in the `raw` field.
+# Level N>0 nodes derive their surface form from components.
+# This sentinel marks that derivation is needed.
+# ─────────────────────────────────────────────
+
+DERIVED = "__derived__"
+
+
+# ─────────────────────────────────────────────
+# SLOT SENTINEL — used in hyperedge structure
+# ─────────────────────────────────────────────
+
+SLOT = "__slot__"
+
+
+# ─────────────────────────────────────────────
+# TIMESTAMP
+# ─────────────────────────────────────────────
+
+def now() -> float:
+    return time.time()
+
+
+# ─────────────────────────────────────────────
+# PMI — pointwise mutual information
 #
-# SENTENCE: 128 dims — word hash features give
-#   genuine lexical signal in 128 dims.
+# Measures how much two things belong together
+# beyond what chance would predict.
 #
-# AXIOM: 256 dims — axioms are dense with technical
-#   vocabulary and logical structure. Need more dims
-#   to distinguish axioms from different domains.
-# ─────────────────────────────────────────────
-
-EMBEDDING_DIM = {
-    Level.CHARACTER : 16,
-    Level.WORD      : 64,
-    Level.SENTENCE  : 128,
-    Level.AXIOM     : 256,
-}
-
-
-# ─────────────────────────────────────────────
-# MUTUAL INFORMATION MERGE THRESHOLD PER LEVEL
+# PMI(A,B) = log( P(AB) / (P(A) * P(B)) )
 #
-# Two nodes at level N merge into a composite at level N+1
-# when their mutual information exceeds this threshold.
-# ─────────────────────────────────────────────
-
-MERGE_THRESHOLD = {
-    Level.CHARACTER : 0.15,   # characters merge readily into words
-    Level.WORD      : 0.10,   # words merge into sentences with moderate signal
-    Level.SENTENCE  : 0.05,   # sentences merge into axioms very selectively
-                              # — only the most load-bearing combinations
-}
-
-
-# ─────────────────────────────────────────────
-# REWARD SCALE PER LEVEL
+# High PMI = the combination is non-accidental.
+# Low PMI  = the combination is coincidental.
 #
-# Raw rewards are normalized within each level.
-# Axioms get the highest reward scale — they are
-# the most valuable nodes in the graph.
+# This is the compression signal.
 # ─────────────────────────────────────────────
 
-REWARD_SCALE = {
-    Level.CHARACTER : 1.0,
-    Level.WORD      : 2.0,
-    Level.SENTENCE  : 4.0,
-    Level.AXIOM     : 8.0,
-}
+import math
+
+def pmi(count_ab: int, count_a: int, count_b: int, total: int) -> float:
+    """
+    Pointwise mutual information between A and B.
+    Returns value in [-inf, +inf]. Positive = meaningful co-occurrence.
+    Normalized to [0, 1] for use as compression signal.
+    """
+    if count_ab == 0 or count_a == 0 or count_b == 0 or total == 0:
+        return 0.0
+
+    p_ab = count_ab / total
+    p_a  = count_a  / total
+    p_b  = count_b  / total
+
+    raw = math.log(p_ab / (p_a * p_b + 1e-10) + 1e-10)
+
+    # Normalize: PMI ranges from -inf to log(1/p_ab)
+    # We clip and map to [0, 1]
+    clipped = max(-5.0, min(5.0, raw))
+    return (clipped + 5.0) / 10.0
 
 
 # ─────────────────────────────────────────────
-# AXIOM TYPES
+# NOVELTY — how different is this from what we know
 #
-# Axioms are tagged by their logical role.
-# This is stored as metadata on axiom nodes —
-# not as separate node types, just a label.
+# Used by ingestion as the boundary test.
+# High novelty = crosses the membrane.
+# Low novelty  = just reinforcement.
 # ─────────────────────────────────────────────
 
-class AxiomType:
-    DEFINITION  = "definition"   # establishes what something IS
-    RULE        = "rule"         # establishes what can be DONE
-    CONSTRAINT  = "constraint"   # establishes what CANNOT be done
-    RELATION    = "relation"     # establishes how things RELATE
-    PROCEDURE   = "procedure"    # establishes HOW to do something
-
-
-# ─────────────────────────────────────────────
-# CHARACTER VOCABULARY
-#
-# The complete set of characters the graph knows.
-# Finite and exhaustive — all printable ASCII plus
-# structural whitespace. Nothing outside this set
-# enters the graph at the character level.
-# ─────────────────────────────────────────────
-
-CHAR_VOCAB = (
-    [chr(i) for i in range(32, 127)]   # printable ASCII (95 chars)
-    + ['\n', '\t']                      # structural whitespace
-)
-
-CHAR_TO_ID  = {c: i for i, c in enumerate(CHAR_VOCAB)}
-ID_TO_CHAR  = {i: c for i, c in enumerate(CHAR_VOCAB)}
-VOCAB_SIZE  = len(CHAR_VOCAB)
-
-UNKNOWN_CHAR_ID = VOCAB_SIZE  # for characters outside vocabulary
-
-
-def char_to_id(c: str) -> int:
-    """Map a character to its vocabulary ID."""
-    return CHAR_TO_ID.get(c, UNKNOWN_CHAR_ID)
-
-
-def id_to_char(i: int) -> str:
-    """Map a vocabulary ID back to its character."""
-    return ID_TO_CHAR.get(i, '?')
-
-
-# ─────────────────────────────────────────────
-# TOKENIZATION FUNCTIONS
-# ─────────────────────────────────────────────
-
-def text_to_characters(text: str) -> list[str]:
+def novelty(best_match_weight: float) -> float:
     """
-    Decompose text into Level 0 character atoms.
-    Returns every individual character including whitespace.
-    Only printable ASCII and structural whitespace enter the graph.
+    Novelty is the complement of the best match strength.
+    If the graph has a perfect match (weight=1.0), novelty=0.
+    If the graph has no match (weight=0.0), novelty=1.
     """
-    return [c for c in text if c in CHAR_TO_ID]
-
-
-def text_to_words(text: str) -> list[str]:
-    """
-    Decompose text into Level 1 word atoms.
-    Splits on whitespace. Punctuation attached to words
-    is kept — the graph learns its role from co-occurrence.
-    """
-    return re.findall(r"\S+", text)
-
-
-def text_to_sentences(text: str) -> list[str]:
-    """
-    Decompose text into Level 2 sentence atoms.
-    Sentence boundaries are strong causal transition points.
-    Splits on sentence-ending punctuation followed by whitespace.
-    """
-    raw = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [s.strip() for s in raw if s.strip()]
-
-
-def text_to_axioms(text: str) -> list[str]:
-    """
-    Decompose text into Level 3 axiom atoms.
-
-    Axioms are delimited by:
-        - Double newlines (explicit separation)
-        - Numbered list items (1. 2. 3.)
-        - Bullet points (• - *)
-        - Semicolons joining independent clauses
-
-    Single axioms stay whole. Multi-sentence axioms
-    where all sentences form one foundational truth
-    stay whole.
-
-    Used when ingesting structured axiom corpora
-    from frontier model extraction.
-    """
-    # Try numbered list first
-    numbered = re.split(r'\n\s*\d+\.\s+', text.strip())
-    if len(numbered) > 2:
-        return [a.strip() for a in numbered if a.strip() and len(a.strip()) > 10]
-
-    # Try bullet points
-    bulleted = re.split(r'\n\s*[•\-\*]\s+', text.strip())
-    if len(bulleted) > 2:
-        return [a.strip() for a in bulleted if a.strip() and len(a.strip()) > 10]
-
-    # Try double newline separation
-    paragraphed = re.split(r'\n\s*\n', text.strip())
-    if len(paragraphed) > 1:
-        return [a.strip() for a in paragraphed if a.strip() and len(a.strip()) > 10]
-
-    # Single axiom — return whole
-    stripped = text.strip()
-    if stripped and len(stripped) > 10:
-        return [stripped]
-
-    return []
-
-
-# ─────────────────────────────────────────────
-# LEVEL DETECTION
-# ─────────────────────────────────────────────
-
-def infer_level(text: str) -> Level:
-    """
-    Infer the hierarchy level of a text unit from structure.
-
-    CHARACTER : exactly one character
-    WORD      : no whitespace, no newlines
-    AXIOM     : multi-sentence or explicitly structured (numbered,
-                bulleted) foundational statements
-    SENTENCE  : everything else
-    """
-    stripped = text.strip()
-
-    if len(stripped) == 1:
-        return Level.CHARACTER
-
-    if ' ' not in stripped and '\n' not in stripped:
-        return Level.WORD
-
-    # Multi-sentence text with structure → AXIOM
-    sentences = text_to_sentences(stripped)
-    has_structure = (
-        bool(re.search(r'\n\s*\d+\.', stripped)) or
-        bool(re.search(r'\n\s*[•\-\*]', stripped)) or
-        len(sentences) > 2
-    )
-    if has_structure:
-        return Level.AXIOM
-
-    return Level.SENTENCE
-
-
-# ─────────────────────────────────────────────
-# LEVEL DECOMPOSITION DISPATCH
-# ─────────────────────────────────────────────
-
-def decompose(text: str, level: Level) -> list[str]:
-    """
-    Decompose a text unit at the given level
-    into its constituent units at level - 1.
-
-    AXIOM     → SENTENCE  (axiom broken into component sentences)
-    SENTENCE  → WORD      (sentence broken into words)
-    WORD      → CHARACTER (word broken into characters)
-    CHARACTER → CHARACTER (atomic — no further decomposition)
-    """
-    if level == Level.AXIOM:
-        sentences = text_to_sentences(text)
-        # Filter out numbering artifacts ("1.", "2.", "a)", etc.)
-        # and very short fragments that aren't real sentences
-        return [
-            s for s in sentences
-            if len(s.split()) >= 3
-            and not re.match(r'^\d+\.?\)?$', s.strip())
-            and not re.match(r'^[a-z]\.?\)?$', s.strip())
-        ]
-
-    if level == Level.SENTENCE:
-        return text_to_words(text)
-
-    if level == Level.WORD:
-        return text_to_characters(text)
-
-    if level == Level.CHARACTER:
-        return [text]
-
-    raise ValueError(f"Unknown level: {level}")
-
-
-# ─────────────────────────────────────────────
-# LEVEL METADATA
-# ─────────────────────────────────────────────
-
-LEVEL_NAMES = {
-    Level.CHARACTER : "character",
-    Level.WORD      : "word",
-    Level.SENTENCE  : "sentence",
-    Level.AXIOM     : "axiom",
-}
-
-LEVEL_FROM_NAME = {v: k for k, v in LEVEL_NAMES.items()}
-
-
-def level_name(level: Level) -> str:
-    return LEVEL_NAMES.get(level, "unknown")
-
-
-def level_from_name(name: str) -> Level:
-    """Parse a level name string into a Level enum."""
-    name = name.lower().strip()
-    if name not in LEVEL_FROM_NAME:
-        raise ValueError(
-            f"Unknown level name: '{name}'. "
-            f"Valid: {list(LEVEL_FROM_NAME.keys())}"
-        )
-    return LEVEL_FROM_NAME[name]
+    return 1.0 - best_match_weight
 
 
 if __name__ == "__main__":
-    print("=== atoms.py smoke test ===\n")
-    print(f"Vocab size: {VOCAB_SIZE} characters")
-    print(f"Levels: {[l.name for l in Level]}\n")
+    print("=== atoms.py ===\n")
+    print(f"BASE_DECAY           : {BASE_DECAY}")
+    print(f"COMPRESSION_THRESHOLD: {COMPRESSION_THRESHOLD}")
+    print(f"BOUNDARY_SENSITIVITY : {BOUNDARY_SENSITIVITY}")
+    print()
 
-    # Character layer
-    print("Characters in 'Hello!':")
-    for c in text_to_characters("Hello!"):
-        print(f"  {repr(c)} → id {char_to_id(c)}")
+    print("Decay rates by level:")
+    for level in range(6):
+        print(f"  level {level}: {decay_rate(level):.6f}")
+    print()
 
-    # Word layer
-    print("\nWords in 'The derivative of x is 1.':")
-    for w in text_to_words("The derivative of x is 1."):
-        print(f"  {repr(w)}")
+    print("PMI examples:")
+    # Strong co-occurrence
+    print(f"  Strong: {pmi(80, 100, 100, 1000):.4f}")
+    # Weak co-occurrence
+    print(f"  Weak:   {pmi(3,  100, 100, 1000):.4f}")
+    # No co-occurrence
+    print(f"  None:   {pmi(0,  100, 100, 1000):.4f}")
+    print()
 
-    # Sentence layer
-    print("\nSentences in sample text:")
-    sample = "For all real x, d/dx(x^2) = 2x. This follows from the power rule."
-    for s in text_to_sentences(sample):
-        print(f"  {repr(s)}")
-
-    # Axiom layer
-    print("\nAxioms from structured text:")
-    axiom_text = """
-1. For any function x^n, the derivative is n·x^(n-1).
-2. The derivative of a sum equals the sum of derivatives.
-3. The derivative of a constant is zero.
-""".strip()
-    for a in text_to_axioms(axiom_text):
-        print(f"  {repr(a[:70])}")
-
-    # Level inference
-    print("\nLevel inference:")
-    tests = [
-        "a",
-        "derivative",
-        "The derivative of x squared is 2x.",
-        axiom_text,
-    ]
-    for t in tests:
-        print(f"  {repr(t[:40]):45s} → {level_name(infer_level(t))}")
-
-    # Decomposition
-    print("\nDecompose AXIOM → SENTENCE:")
-    for s in decompose(axiom_text, Level.AXIOM):
-        print(f"  {repr(s[:60])}")
+    print("Novelty examples:")
+    print(f"  Perfect match : {novelty(1.0):.4f}")
+    print(f"  Partial match : {novelty(0.6):.4f}")
+    print(f"  No match      : {novelty(0.0):.4f}")

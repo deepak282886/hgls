@@ -1,46 +1,108 @@
 """
 graph.py
 
-The graph — persistent storage and interface for all nodes and edges.
-
-Uses SQLite as the backend. The graph lives on disk and grows
-continuously across sessions. No full reload needed — nodes and
-edges are queried lazily as MCTS and traversal need them.
-
-Responsibilities:
-    - Add nodes and edges
-    - Query nodes by ID, level, reward, V value
-    - Query edges by source, target, type
-    - Maintain an in-memory cache of recently accessed nodes/edges
-    - Assign stable integer IDs to new nodes and edges
-    - Track graph-level statistics for the normalizer
+The data structure. One persistent weighted directed hypergraph.
+SQLite backed. Three tables: nodes, edges, hyperedges.
 
 Design principles:
-    - Every write is immediate — no batching that could lose data
-    - Reads are cached — hot nodes stay in memory
-    - The graph never deletes — only grows
-    - Thread-safe writes via SQLite's built-in locking
+    - Identity is structure, not surface form
+      Level 0 nodes store raw text. Level N nodes store component IDs.
+      Surface text is always derived, never stored as identity.
+
+    - One unified node table for all states
+      provisional, stable, hypothetical, decaying — all in same table.
+      State is just a field. No separate provisional buffer.
+
+    - Decay runs on everything
+      Every node and edge has a decay rate derived from its level.
+      Nothing is exempt.
+
+    - Three parameters only
+      BASE_DECAY, COMPRESSION_THRESHOLD, BOUNDARY_SENSITIVITY.
+      Everything else derived.
 """
 
 import sqlite3
+import json
 import time
-import os
-import numpy as np
-from collections import OrderedDict
 from typing import Optional, Iterator
+from collections import OrderedDict
 
-from core.atoms import Level
-from core.node import Node, make_node
-from core.edge import Edge, EdgeType, make_edge
+from core.atoms import (
+    State, decay_rate, now,
+    DERIVED, SLOT,
+    BASE_DECAY, ACTIVATION_BOOST,
+    STABLE_THRESHOLD, DISSOLVE_THRESHOLD, ACTIVATION_MIN,
+)
+
+
+# ─────────────────────────────────────────────
+# SCHEMA
+# ─────────────────────────────────────────────
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-32000;
+
+CREATE TABLE IF NOT EXISTS nodes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    level        INTEGER NOT NULL DEFAULT 0,
+    components   TEXT    NOT NULL DEFAULT '[]',
+    raw          TEXT    NOT NULL DEFAULT '',
+    weight       REAL    NOT NULL DEFAULT 0.5,
+    state        TEXT    NOT NULL DEFAULT 'provisional',
+    created_at   REAL    NOT NULL,
+    activated_at REAL    NOT NULL,
+    decay_rate   REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id    INTEGER NOT NULL REFERENCES nodes(id),
+    target_id    INTEGER NOT NULL REFERENCES nodes(id),
+    weight       REAL    NOT NULL DEFAULT 0.5,
+    observed     INTEGER NOT NULL DEFAULT 1,
+    created_at   REAL    NOT NULL,
+    activated_at REAL    NOT NULL,
+    decay_rate   REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hyperedges (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    level        INTEGER NOT NULL DEFAULT 0,
+    structure    TEXT    NOT NULL DEFAULT '[]',
+    constraints  TEXT    NOT NULL DEFAULT '{}',
+    instances    TEXT    NOT NULL DEFAULT '[]',
+    weight       REAL    NOT NULL DEFAULT 0.5,
+    state        TEXT    NOT NULL DEFAULT 'provisional',
+    created_at   REAL    NOT NULL,
+    activated_at REAL    NOT NULL,
+    decay_rate   REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_level       ON nodes(level);
+CREATE INDEX IF NOT EXISTS idx_nodes_state       ON nodes(state);
+CREATE INDEX IF NOT EXISTS idx_nodes_weight      ON nodes(weight);
+CREATE INDEX IF NOT EXISTS idx_nodes_raw         ON nodes(raw);
+CREATE INDEX IF NOT EXISTS idx_edges_source      ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target      ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_hyperedges_level  ON hyperedges(level);
+CREATE INDEX IF NOT EXISTS idx_hyperedges_state  ON hyperedges(state);
+"""
 
 
 # ─────────────────────────────────────────────
 # LRU CACHE
-# Simple bounded cache for hot nodes/edges
 # ─────────────────────────────────────────────
 
 class LRUCache:
-    def __init__(self, capacity: int = 10_000):
+    def __init__(self, capacity: int = 5000):
         self.cache    = OrderedDict()
         self.capacity = capacity
 
@@ -60,100 +122,24 @@ class LRUCache:
     def invalidate(self, key):
         self.cache.pop(key, None)
 
-    def __len__(self):
-        return len(self.cache)
-
-
-# ─────────────────────────────────────────────
-# SCHEMA
-# ─────────────────────────────────────────────
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA cache_size=-64000;
-
-CREATE TABLE IF NOT EXISTS nodes (
-    node_id      INTEGER PRIMARY KEY,
-    text         TEXT    NOT NULL,
-    level        INTEGER NOT NULL,
-    embedding    BLOB    NOT NULL,
-    reward       REAL    DEFAULT 0.0,
-    norm_reward  REAL    DEFAULT 0.0,
-    V            REAL    DEFAULT 0.0,
-    norm_V       REAL    DEFAULT 0.0,
-    visit_count  INTEGER DEFAULT 0,
-    total_reward REAL    DEFAULT 0.0,
-    created_at   REAL    NOT NULL,
-    is_terminal  INTEGER DEFAULT 0,
-    children     TEXT    DEFAULT '',
-    parents      TEXT    DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS edges (
-    edge_id      INTEGER PRIMARY KEY,
-    source_id    INTEGER NOT NULL,
-    target_id    INTEGER NOT NULL,
-    edge_type    INTEGER NOT NULL,
-    reward       REAL    DEFAULT 0.0,
-    norm_reward  REAL    DEFAULT 0.0,
-    visit_count  INTEGER DEFAULT 0,
-    total_reward REAL    DEFAULT 0.0,
-    source_level INTEGER NOT NULL,
-    FOREIGN KEY (source_id) REFERENCES nodes(node_id),
-    FOREIGN KEY (target_id) REFERENCES nodes(node_id)
-);
-
-CREATE TABLE IF NOT EXISTS graph_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_nodes_level    ON nodes(level);
-CREATE INDEX IF NOT EXISTS idx_nodes_V        ON nodes(V);
-CREATE INDEX IF NOT EXISTS idx_nodes_reward   ON nodes(reward);
-CREATE INDEX IF NOT EXISTS idx_edges_source   ON edges(source_id);
-CREATE INDEX IF NOT EXISTS idx_edges_target   ON edges(target_id);
-CREATE INDEX IF NOT EXISTS idx_edges_type     ON edges(edge_type);
-"""
-
 
 # ─────────────────────────────────────────────
 # GRAPH
 # ─────────────────────────────────────────────
 
 class Graph:
-    def __init__(self, db_path: str = "graph.db",
-                 cache_size: int = 10_000):
-        """
-        Open or create the graph database.
-
-        db_path    : path to SQLite file. Created if it does not exist.
-        cache_size : max nodes/edges to keep in memory simultaneously.
-        """
+    def __init__(self, db_path: str = "graph.db"):
         self.db_path = db_path
         self._conn   = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
-        self._node_cache = LRUCache(cache_size)
-        self._edge_cache = LRUCache(cache_size)
-
-        # Running ID counters — loaded from DB on open
-        self._next_node_id = self._load_counter("next_node_id", 0)
-        self._next_edge_id = self._load_counter("next_edge_id", 0)
-
-        # Running statistics for normalizer (Welford online algorithm)
-        self._node_count  = self._load_counter("node_count", 0)
-        self._edge_count  = self._load_counter("edge_count", 0)
-
-        # Per-level reward stats for normalization
-        # Format: {level: {"mean": float, "M2": float, "count": int}}
-        self._level_stats = self._load_level_stats()
+        self._node_cache = LRUCache(5000)
+        self._edge_cache = LRUCache(5000)
 
 
     # ─────────────────────────────────────────
-    # SCHEMA INIT
+    # INIT
     # ─────────────────────────────────────────
 
     def _init_schema(self):
@@ -162,611 +148,583 @@ class Graph:
 
 
     # ─────────────────────────────────────────
-    # METADATA PERSISTENCE
+    # NODE — ADD
     # ─────────────────────────────────────────
 
-    def _load_counter(self, key: str, default: int) -> int:
-        row = self._conn.execute(
-            "SELECT value FROM graph_meta WHERE key=?", (key,)
-        ).fetchone()
-        return int(row["value"]) if row else default
-
-    def _save_counter(self, key: str, value: int):
-        self._conn.execute(
-            "INSERT OR REPLACE INTO graph_meta (key, value) VALUES (?,?)",
-            (key, str(value))
-        )
-
-    def _load_level_stats(self) -> dict:
-        stats = {}
-        for level in Level:
-            key = f"level_stats_{int(level)}"
-            row = self._conn.execute(
-                "SELECT value FROM graph_meta WHERE key=?", (key,)
-            ).fetchone()
-            if row:
-                import json
-                stats[level] = json.loads(row["value"])
-            else:
-                stats[level] = {"mean": 0.0, "M2": 0.0, "count": 0}
-        return stats
-
-    def _save_level_stats(self, level: Level):
-        import json
-        key = f"level_stats_{int(level)}"
-        self._conn.execute(
-            "INSERT OR REPLACE INTO graph_meta (key, value) VALUES (?,?)",
-            (key, json.dumps(self._level_stats[level]))
-        )
-
-
-    # ─────────────────────────────────────────
-    # WELFORD ONLINE STATISTICS UPDATE
-    # Updates running mean and variance incrementally.
-    # Called when a new node reward is added at a level.
-    # ─────────────────────────────────────────
-
-    def _welford_update(self, level: Level, new_value: float):
-        s = self._level_stats[level]
-        s["count"] += 1
-        delta  = new_value - s["mean"]
-        s["mean"] += delta / s["count"]
-        delta2 = new_value - s["mean"]
-        s["M2"] += delta * delta2
-
-    def level_mean(self, level: Level) -> float:
-        return self._level_stats[level]["mean"]
-
-    def level_std(self, level: Level) -> float:
-        s = self._level_stats[level]
-        if s["count"] < 2:
-            return 1.0
-        return float(np.sqrt(s["M2"] / (s["count"] - 1)) + 1e-9)
-
-
-    # ─────────────────────────────────────────
-    # ADD NODE
-    # ─────────────────────────────────────────
-
-    def add_node(self, text: str, level: Level,
-                 reward: float = 0.0,
-                 children: Optional[list[int]] = None,
-                 parents:  Optional[list[int]] = None) -> Node:
+    def add_node(
+        self,
+        level      : int,
+        components : list[int],
+        raw        : str   = DERIVED,
+        weight     : float = 0.5,
+        state      : State = State.PROVISIONAL,
+    ) -> int:
         """
-        Create and persist a new node.
-        Returns the Node with its assigned stable ID.
-        """
-        nid  = self._next_node_id
-        node = make_node(nid, text, level, reward, children, parents)
+        Add a new node. Returns node ID.
 
-        # Persist
-        d = node.to_dict()
-        self._conn.execute("""
+        Level 0 nodes: components=[], raw=the actual token
+        Level N nodes: components=[list of level N-1 node IDs], raw=DERIVED
+        """
+        t = now()
+        dr = decay_rate(level)
+
+        cur = self._conn.execute("""
             INSERT INTO nodes
-            (node_id, text, level, embedding, reward, norm_reward,
-             V, norm_V, visit_count, total_reward, created_at,
-             is_terminal, children, parents)
-            VALUES
-            (:node_id,:text,:level,:embedding,:reward,:norm_reward,
-             :V,:norm_V,:visit_count,:total_reward,:created_at,
-             :is_terminal,:children,:parents)
-        """, d)
-
-        # Update counters
-        self._next_node_id += 1
-        self._node_count   += 1
-        self._save_counter("next_node_id", self._next_node_id)
-        self._save_counter("node_count",   self._node_count)
-
-        # Update Welford stats for this level
-        self._welford_update(level, reward)
-        self._save_level_stats(level)
-
+            (level, components, raw, weight, state, created_at, activated_at, decay_rate)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            level,
+            json.dumps(components),
+            raw,
+            weight,
+            state.value,
+            t, t, dr,
+        ))
         self._conn.commit()
-
-        # Cache
-        self._node_cache.put(nid, node)
-        return node
+        return cur.lastrowid
 
 
-    def add_nodes_batch(self, nodes_data: list[tuple]) -> list[int]:
-        """
-        Insert multiple nodes in a single transaction.
-        Dramatically faster than calling add_node() in a loop.
-
-        nodes_data: list of (text, level, reward) tuples
-
-        Returns list of node_ids in the same order as input.
-        Skips nodes whose text already exists at that level.
-        """
-        if not nodes_data:
-            return []
-
-        node_ids = []
-        rows     = []
-        nodes    = []
-
-        for text, level, reward in nodes_data:
-            # Check for existing node
-            existing = self.text_exists(text, level)
-            if existing is not None:
-                node_ids.append(existing)
-                continue
-
-            nid  = self._next_node_id
-            node = make_node(nid, text, level, reward)
-            d    = node.to_dict()
-            rows.append((
-                d["node_id"], d["text"], d["level"], d["embedding"],
-                d["reward"], d["norm_reward"], d["V"], d["norm_V"],
-                d["visit_count"], d["total_reward"], d["created_at"],
-                d["is_terminal"], d["children"], d["parents"],
-            ))
-            nodes.append(node)
-            node_ids.append(nid)
-            self._next_node_id += 1
-            self._node_count   += 1
-            self._welford_update(level, reward)
-
-        if rows:
-            self._conn.executemany("""
-                INSERT OR IGNORE INTO nodes
-                (node_id, text, level, embedding, reward, norm_reward,
-                 V, norm_V, visit_count, total_reward, created_at,
-                 is_terminal, children, parents)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, rows)
-
-            # Update counters once
-            self._save_counter("next_node_id", self._next_node_id)
-            self._save_counter("node_count",   self._node_count)
-
-            # Save level stats once per level
-            levels_seen = set(level for _, level, _ in nodes_data)
-            for level in levels_seen:
-                self._save_level_stats(level)
-
-            self._conn.commit()
-
-            # Cache all new nodes
-            for node in nodes:
-                self._node_cache.put(node.node_id, node)
-
-        return node_ids
-
-    def add_edge(self, source_id: int, target_id: int,
-                 source_text: str, target_text: str,
-                 level: Level,
-                 edge_type: EdgeType = EdgeType.SEQUENTIAL) -> Edge:
-        """
-        Create and persist a new edge between two existing nodes.
-        Returns the Edge with its assigned stable ID.
-
-        Also updates the is_terminal flag on the source node —
-        a node with at least one outgoing edge is not terminal.
-        """
-        eid  = self._next_edge_id
-        edge = make_edge(eid, source_id, target_id,
-                         source_text, target_text, level, edge_type)
-
-        d = edge.to_dict()
-        self._conn.execute("""
-            INSERT INTO edges
-            (edge_id, source_id, target_id, edge_type, reward,
-             norm_reward, visit_count, total_reward, source_level)
-            VALUES
-            (:edge_id,:source_id,:target_id,:edge_type,:reward,
-             :norm_reward,:visit_count,:total_reward,:source_level)
-        """, d)
-
-        # Source node is no longer terminal
-        self._conn.execute(
-            "UPDATE nodes SET is_terminal=0 WHERE node_id=?",
-            (source_id,)
-        )
-
-        # Update counters
-        self._next_edge_id += 1
-        self._edge_count   += 1
-        self._save_counter("next_edge_id", self._next_edge_id)
-        self._save_counter("edge_count",   self._edge_count)
-
-        self._conn.commit()
-
-        # Invalidate source node cache (is_terminal changed)
-        self._node_cache.invalidate(source_id)
-        self._edge_cache.put(eid, edge)
-        return edge
-
-
-    # ─────────────────────────────────────────
-    # GET NODE
-    # ─────────────────────────────────────────
-
-    def get_node(self, node_id: int) -> Optional[Node]:
-        """Retrieve a node by ID. Cache-first."""
+    def get_node(self, node_id: int) -> Optional[dict]:
+        """Get node by ID. Cache-first."""
         cached = self._node_cache.get(node_id)
         if cached is not None:
             return cached
 
         row = self._conn.execute(
-            "SELECT * FROM nodes WHERE node_id=?", (node_id,)
+            "SELECT * FROM nodes WHERE id=?", (node_id,)
         ).fetchone()
 
         if row is None:
             return None
 
-        node = Node.from_dict(dict(row))
+        node = dict(row)
+        node["components"] = json.loads(node["components"])
         self._node_cache.put(node_id, node)
         return node
 
 
+    def update_node_weight(self, node_id: int, weight: float):
+        """Update node weight. Invalidates cache."""
+        weight = max(0.0, min(1.0, weight))
+        self._conn.execute(
+            "UPDATE nodes SET weight=? WHERE id=?", (weight, node_id)
+        )
+        self._conn.commit()
+        self._node_cache.invalidate(node_id)
+
+
+    def update_node_state(self, node_id: int, state: State):
+        """Update node state. Invalidates cache."""
+        self._conn.execute(
+            "UPDATE nodes SET state=? WHERE id=?", (state.value, node_id)
+        )
+        self._conn.commit()
+        self._node_cache.invalidate(node_id)
+
+
+    def activate_node(self, node_id: int):
+        """
+        Record activation — boost weight, reset activated_at.
+        This is what prevents decay from dissolving useful nodes.
+        """
+        t = now()
+        self._conn.execute("""
+            UPDATE nodes
+            SET weight       = MIN(1.0, weight + ?),
+                activated_at = ?
+            WHERE id = ?
+        """, (ACTIVATION_BOOST, t, node_id))
+        self._conn.commit()
+        self._node_cache.invalidate(node_id)
+
+
+    def find_node(
+        self,
+        level      : int,
+        components : list[int],
+        raw        : str = DERIVED,
+    ) -> Optional[int]:
+        """
+        Find an existing node by its identity (level + components or raw).
+        Returns node ID if found, None otherwise.
+        """
+        if level == 0:
+            row = self._conn.execute(
+                "SELECT id FROM nodes WHERE level=0 AND raw=? LIMIT 1",
+                (raw,)
+            ).fetchone()
+        else:
+            comp_str = json.dumps(sorted(components))
+            row = self._conn.execute(
+                "SELECT id FROM nodes WHERE level=? AND components=? LIMIT 1",
+                (level, json.dumps(components))
+            ).fetchone()
+
+        return row[0] if row else None
+
+
+    def get_or_create_node(
+        self,
+        level      : int,
+        components : list[int],
+        raw        : str   = DERIVED,
+        weight     : float = 0.5,
+        state      : State = State.PROVISIONAL,
+    ) -> tuple[int, bool]:
+        """
+        Get existing node or create new one.
+        Returns (node_id, is_new).
+        """
+        existing = self.find_node(level, components, raw)
+        if existing is not None:
+            return existing, False
+        nid = self.add_node(level, components, raw, weight, state)
+        return nid, True
+
+
+    def nodes_by_state(self, state: State, limit: int = 1000) -> list[dict]:
+        """All nodes in a given state."""
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE state=? ORDER BY weight DESC LIMIT ?",
+            (state.value, limit)
+        ).fetchall()
+        nodes = []
+        for row in rows:
+            n = dict(row)
+            n["components"] = json.loads(n["components"])
+            nodes.append(n)
+        return nodes
+
+
+    def nodes_by_level(self, level: int, limit: int = 1000) -> list[dict]:
+        """All stable nodes at a given level."""
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE level=? AND state=? ORDER BY weight DESC LIMIT ?",
+            (level, State.STABLE.value, limit)
+        ).fetchall()
+        nodes = []
+        for row in rows:
+            n = dict(row)
+            n["components"] = json.loads(n["components"])
+            nodes.append(n)
+        return nodes
+
+
+    def search_nodes_by_raw(
+        self,
+        text  : str,
+        level : int = 0,
+        limit : int = 10,
+    ) -> list[dict]:
+        """Find level-0 nodes whose raw text contains the given string."""
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE level=? AND raw LIKE ? ORDER BY weight DESC LIMIT ?",
+            (level, f"%{text}%", limit)
+        ).fetchall()
+        nodes = []
+        for row in rows:
+            n = dict(row)
+            n["components"] = json.loads(n["components"])
+            nodes.append(n)
+        return nodes
+
+
+    def all_node_ids(
+        self,
+        state : Optional[State] = None,
+        level : Optional[int]   = None,
+    ) -> list[int]:
+        """All node IDs, optionally filtered."""
+        if state and level is not None:
+            rows = self._conn.execute(
+                "SELECT id FROM nodes WHERE state=? AND level=?",
+                (state.value, level)
+            ).fetchall()
+        elif state:
+            rows = self._conn.execute(
+                "SELECT id FROM nodes WHERE state=?", (state.value,)
+            ).fetchall()
+        elif level is not None:
+            rows = self._conn.execute(
+                "SELECT id FROM nodes WHERE level=?", (level,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT id FROM nodes").fetchall()
+        return [r[0] for r in rows]
+
+
     # ─────────────────────────────────────────
-    # GET EDGE
+    # EDGE — ADD
     # ─────────────────────────────────────────
 
-    def get_edge(self, edge_id: int) -> Optional[Edge]:
-        """Retrieve an edge by ID. Cache-first."""
+    def add_edge(
+        self,
+        source_id : int,
+        target_id : int,
+        weight    : float = 0.5,
+    ) -> int:
+        """Add a directed edge. Returns edge ID."""
+        t  = now()
+        # Edge level = min of node levels — conservative
+        src = self.get_node(source_id)
+        tgt = self.get_node(target_id)
+        level = min(
+            src["level"] if src else 0,
+            tgt["level"] if tgt else 0,
+        )
+        dr = decay_rate(level)
+
+        cur = self._conn.execute("""
+            INSERT INTO edges
+            (source_id, target_id, weight, observed, created_at, activated_at, decay_rate)
+            VALUES (?,?,?,1,?,?,?)
+        """, (source_id, target_id, weight, t, t, dr))
+        self._conn.commit()
+        return cur.lastrowid
+
+
+    def get_edge(self, edge_id: int) -> Optional[dict]:
+        """Get edge by ID. Cache-first."""
         cached = self._edge_cache.get(edge_id)
         if cached is not None:
             return cached
 
         row = self._conn.execute(
-            "SELECT * FROM edges WHERE edge_id=?", (edge_id,)
+            "SELECT * FROM edges WHERE id=?", (edge_id,)
         ).fetchone()
 
         if row is None:
             return None
 
-        edge = Edge.from_dict(dict(row))
+        edge = dict(row)
         self._edge_cache.put(edge_id, edge)
         return edge
 
 
-    # ─────────────────────────────────────────
-    # GET OUTGOING EDGES
-    # ─────────────────────────────────────────
-
-    def get_outgoing_edges(self, node_id: int) -> list[Edge]:
-        """All edges where source_id = node_id."""
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE source_id=?", (node_id,)
-        ).fetchall()
-        edges = []
-        for row in rows:
-            e = Edge.from_dict(dict(row))
-            self._edge_cache.put(e.edge_id, e)
-            edges.append(e)
-        return edges
-
-
-    # ─────────────────────────────────────────
-    # GET INCOMING EDGES
-    # ─────────────────────────────────────────
-
-    def get_incoming_edges(self, node_id: int) -> list[Edge]:
-        """All edges where target_id = node_id."""
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE target_id=?", (node_id,)
-        ).fetchall()
-        edges = []
-        for row in rows:
-            e = Edge.from_dict(dict(row))
-            self._edge_cache.put(e.edge_id, e)
-            edges.append(e)
-        return edges
-
-
-    # ─────────────────────────────────────────
-    # UPDATE NODE V AND VISIT STATS
-    # ─────────────────────────────────────────
-
-    def update_node_V(self, node_id: int, V: float, norm_V: float = 0.0):
-        """Update Bellman value for a node. Invalidates cache."""
-        self._conn.execute(
-            "UPDATE nodes SET V=?, norm_V=? WHERE node_id=?",
-            (V, norm_V, node_id)
-        )
-        self._conn.commit()
-        self._node_cache.invalidate(node_id)
-
-    def update_node_reward(self, node_id: int,
-                           reward: float, norm_reward: float = 0.0):
-        """Update reward for a node. Invalidates cache."""
-        self._conn.execute(
-            "UPDATE nodes SET reward=?, norm_reward=? WHERE node_id=?",
-            (reward, norm_reward, node_id)
-        )
-        self._conn.commit()
-        self._node_cache.invalidate(node_id)
-
-    def record_node_visit(self, node_id: int, reward: float):
-        """Record an MCTS visit to a node."""
-        self._conn.execute("""
-            UPDATE nodes
-            SET visit_count  = visit_count + 1,
-                total_reward = total_reward + ?
-            WHERE node_id = ?
-        """, (reward, node_id))
-        self._conn.commit()
-        self._node_cache.invalidate(node_id)
-
-    def record_edge_visit(self, edge_id: int, reward: float):
-        """Record an MCTS visit through an edge."""
-        self._conn.execute("""
-            UPDATE edges
-            SET visit_count  = visit_count + 1,
-                total_reward = total_reward + ?
-            WHERE edge_id = ?
-        """, (reward, edge_id))
-        self._conn.commit()
-        self._edge_cache.invalidate(edge_id)
-
-    def update_edge_norm_reward(self, edge_id: int, norm_reward: float):
-        """Update normalized reward for an edge."""
-        self._conn.execute(
-            "UPDATE edges SET norm_reward=? WHERE edge_id=?",
-            (norm_reward, edge_id)
-        )
-        self._conn.commit()
-        self._edge_cache.invalidate(edge_id)
-
-
-    # ─────────────────────────────────────────
-    # QUERY NODES
-    # ─────────────────────────────────────────
-
-    def nodes_by_level(self, level: Level,
-                       limit: int = 1000) -> list[Node]:
-        """All nodes at a given hierarchy level."""
-        rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE level=? ORDER BY V DESC LIMIT ?",
-            (int(level), limit)
-        ).fetchall()
-        return [Node.from_dict(dict(r)) for r in rows]
-
-    def top_nodes(self, n: int = 20, level: Optional[Level] = None) -> list[Node]:
-        """Top N nodes by Bellman V value, optionally filtered by level."""
-        if level is not None:
-            rows = self._conn.execute(
-                "SELECT * FROM nodes WHERE level=? ORDER BY V DESC LIMIT ?",
-                (int(level), n)
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM nodes ORDER BY V DESC LIMIT ?", (n,)
-            ).fetchall()
-        return [Node.from_dict(dict(r)) for r in rows]
-
-    def terminal_nodes(self, level: Optional[Level] = None) -> list[Node]:
-        """Nodes with no outgoing edges — natural endpoints."""
-        if level is not None:
-            rows = self._conn.execute(
-                "SELECT * FROM nodes WHERE is_terminal=1 AND level=? ORDER BY V DESC",
-                (int(level),)
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM nodes WHERE is_terminal=1 ORDER BY V DESC"
-            ).fetchall()
-        return [Node.from_dict(dict(r)) for r in rows]
-
-    def nodes_since(self, created_after: float) -> list[Node]:
-        """Nodes created after a given timestamp. Used by delta propagator."""
-        rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE created_at > ? ORDER BY created_at ASC",
-            (created_after,)
-        ).fetchall()
-        return [Node.from_dict(dict(r)) for r in rows]
-
-    def all_node_ids(self, level: Optional[Level] = None) -> list[int]:
-        """All node IDs, optionally filtered by level."""
-        if level is not None:
-            rows = self._conn.execute(
-                "SELECT node_id FROM nodes WHERE level=?", (int(level),)
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT node_id FROM nodes"
-            ).fetchall()
-        return [r[0] for r in rows]
-
-    def text_exists(self, text: str, level: Level) -> Optional[int]:
-        """
-        Check if a node with exact text already exists at this level.
-        Returns node_id if found, None otherwise.
-        Prevents duplicate nodes for identical text units.
-        """
+    def find_edge(self, source_id: int, target_id: int) -> Optional[int]:
+        """Find existing edge between two nodes. Returns edge ID or None."""
         row = self._conn.execute(
-            "SELECT node_id FROM nodes WHERE text=? AND level=? LIMIT 1",
-            (text, int(level))
+            "SELECT id FROM edges WHERE source_id=? AND target_id=? LIMIT 1",
+            (source_id, target_id)
         ).fetchone()
         return row[0] if row else None
 
 
-    def search_nodes_by_keyword(
+    def get_or_create_edge(
         self,
-        keyword : str,
-        level   : Level,
-        limit   : int = 10,
-    ) -> list:
-        """
-        Find nodes at the given level whose text contains keyword.
-        Returns list of Nodes ordered by V descending — highest-value
-        matches first, so seeds are the most useful nodes for that term.
+        source_id : int,
+        target_id : int,
+        weight    : float = 0.5,
+    ) -> tuple[int, bool]:
+        """Get existing edge or create. Returns (edge_id, is_new)."""
+        existing = self.find_edge(source_id, target_id)
+        if existing is not None:
+            return existing, False
+        eid = self.add_edge(source_id, target_id, weight)
+        return eid, True
 
-        Used by activation.py for text-based query seeding.
-        SQLite LIKE is case-insensitive for ASCII by default.
-        """
+
+    def activate_edge(self, edge_id: int):
+        """Boost edge weight and reset decay timer."""
+        t = now()
+        self._conn.execute("""
+            UPDATE edges
+            SET weight       = MIN(1.0, weight + ?),
+                observed     = observed + 1,
+                activated_at = ?
+            WHERE id = ?
+        """, (ACTIVATION_BOOST, t, edge_id))
+        self._conn.commit()
+        self._edge_cache.invalidate(edge_id)
+
+
+    def get_outgoing_edges(self, node_id: int) -> list[dict]:
+        """All edges where source_id = node_id."""
         rows = self._conn.execute(
-            "SELECT node_id FROM nodes "
-            "WHERE level=? AND text LIKE ? "
-            "ORDER BY V DESC LIMIT ?",
-            (int(level), f"%{keyword}%", limit)
+            "SELECT * FROM edges WHERE source_id=? ORDER BY weight DESC",
+            (node_id,)
         ).fetchall()
-        nodes = []
-        for (nid,) in rows:
-            node = self.get_node(nid)
-            if node is not None:
-                nodes.append(node)
-        return nodes
+        edges = []
+        for row in rows:
+            e = dict(row)
+            self._edge_cache.put(e["id"], e)
+            edges.append(e)
+        return edges
+
+
+    def get_incoming_edges(self, node_id: int) -> list[dict]:
+        """All edges where target_id = node_id."""
+        rows = self._conn.execute(
+            "SELECT * FROM edges WHERE target_id=? ORDER BY weight DESC",
+            (node_id,)
+        ).fetchall()
+        edges = []
+        for row in rows:
+            e = dict(row)
+            self._edge_cache.put(e["id"], e)
+            edges.append(e)
+        return edges
 
 
     # ─────────────────────────────────────────
-    # EDGE EXISTS CHECK
+    # HYPEREDGE — ADD
     # ─────────────────────────────────────────
 
-    def edge_exists(self, source_id: int, target_id: int) -> bool:
-        """Check if a directed edge already exists between two nodes."""
-        row = self._conn.execute(
-            "SELECT edge_id FROM edges WHERE source_id=? AND target_id=? LIMIT 1",
-            (source_id, target_id)
-        ).fetchone()
-        return row is not None
-
-
-    def add_edges_batch(
+    def add_hyperedge(
         self,
-        edges: list[tuple[int, int, str, str, "Level", "EdgeType"]],
+        level       : int,
+        structure   : list,       # list of (node_id | SLOT)
+        constraints : dict = None,
+        instances   : list = None,
+        weight      : float = 0.5,
+        state       : State = State.PROVISIONAL,
     ) -> int:
-        """
-        Insert multiple edges in a single transaction.
-        Dramatically faster than calling add_edge() in a loop.
+        """Add a hyperedge (schema). Returns hyperedge ID."""
+        t  = now()
+        dr = decay_rate(level)
 
-        edges: list of (source_id, target_id, source_text,
-                        target_text, level, edge_type)
-
-        Skips edges that already exist.
-        Returns number of edges actually inserted.
-        """
-        from core.edge import make_edge, EdgeType as ET
-
-        if not edges:
-            return 0
-
-        inserted   = 0
-        rows       = []
-        source_ids = set()
-
-        for source_id, target_id, source_text, target_text, level, edge_type in edges:
-            # Check existence in one query per pair — still needed for safety
-            # but we batch the inserts
-            if self.edge_exists(source_id, target_id):
-                continue
-
-            eid  = self._next_edge_id
-            edge = make_edge(eid, source_id, target_id,
-                             source_text, target_text, level, edge_type)
-            d = edge.to_dict()
-            rows.append((
-                d["edge_id"], d["source_id"], d["target_id"],
-                d["edge_type"], d["reward"], d["norm_reward"],
-                d["visit_count"], d["total_reward"], d["source_level"],
-            ))
-            self._next_edge_id += 1
-            self._edge_count   += 1
-            source_ids.add(source_id)
-            inserted += 1
-
-        if not rows:
-            return 0
-
-        # Single bulk insert
-        self._conn.executemany("""
-            INSERT OR IGNORE INTO edges
-            (edge_id, source_id, target_id, edge_type, reward,
-             norm_reward, visit_count, total_reward, source_level)
+        cur = self._conn.execute("""
+            INSERT INTO hyperedges
+            (level, structure, constraints, instances, weight, state,
+             created_at, activated_at, decay_rate)
             VALUES (?,?,?,?,?,?,?,?,?)
-        """, rows)
+        """, (
+            level,
+            json.dumps(structure),
+            json.dumps(constraints or {}),
+            json.dumps(instances   or []),
+            weight,
+            state.value,
+            t, t, dr,
+        ))
+        self._conn.commit()
+        return cur.lastrowid
 
-        # Mark all source nodes as non-terminal in one query
-        if source_ids:
-            placeholders = ",".join("?" * len(source_ids))
+
+    def get_hyperedge(self, hid: int) -> Optional[dict]:
+        """Get hyperedge by ID."""
+        row = self._conn.execute(
+            "SELECT * FROM hyperedges WHERE id=?", (hid,)
+        ).fetchone()
+        if row is None:
+            return None
+        h = dict(row)
+        h["structure"]   = json.loads(h["structure"])
+        h["constraints"] = json.loads(h["constraints"])
+        h["instances"]   = json.loads(h["instances"])
+        return h
+
+
+    def add_instance_to_hyperedge(self, hid: int, node_id: int):
+        """Add a node as a known instance of a hyperedge."""
+        h = self.get_hyperedge(hid)
+        if h is None:
+            return
+        instances = h["instances"]
+        if node_id not in instances:
+            instances.append(node_id)
             self._conn.execute(
-                f"UPDATE nodes SET is_terminal=0 WHERE node_id IN ({placeholders})",
-                list(source_ids),
+                "UPDATE hyperedges SET instances=? WHERE id=?",
+                (json.dumps(instances), hid)
             )
+            self._conn.commit()
 
-        # Update counters once
-        self._save_counter("next_edge_id", self._next_edge_id)
-        self._save_counter("edge_count",   self._edge_count)
+
+    def activate_hyperedge(self, hid: int):
+        """Boost hyperedge weight and reset decay timer."""
+        t = now()
+        self._conn.execute("""
+            UPDATE hyperedges
+            SET weight       = MIN(1.0, weight + ?),
+                activated_at = ?
+            WHERE id = ?
+        """, (ACTIVATION_BOOST, t, hid))
         self._conn.commit()
 
-        # Invalidate cache for source nodes
-        for sid in source_ids:
-            self._node_cache.invalidate(sid)
 
-        return inserted
-
-
-    # ─────────────────────────────────────────
-    # STATISTICS
-    # ─────────────────────────────────────────
-
-    def stats(self) -> dict:
-        """Graph-level statistics for monitoring."""
-        node_count = self._conn.execute(
-            "SELECT COUNT(*) FROM nodes"
-        ).fetchone()[0]
-        edge_count = self._conn.execute(
-            "SELECT COUNT(*) FROM edges"
-        ).fetchone()[0]
-        level_counts = {}
-        for level in Level:
-            c = self._conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE level=?", (int(level),)
-            ).fetchone()[0]
-            level_counts[level.name] = c
-        avg_V = self._conn.execute(
-            "SELECT AVG(V) FROM nodes"
-        ).fetchone()[0] or 0.0
-        max_V = self._conn.execute(
-            "SELECT MAX(V) FROM nodes"
-        ).fetchone()[0] or 0.0
-        terminal_count = self._conn.execute(
-            "SELECT COUNT(*) FROM nodes WHERE is_terminal=1"
-        ).fetchone()[0]
-
-        return {
-            "node_count"    : node_count,
-            "edge_count"    : edge_count,
-            "level_counts"  : level_counts,
-            "avg_V"         : round(avg_V, 4),
-            "max_V"         : round(max_V, 4),
-            "terminal_count": terminal_count,
-            "cache_size"    : len(self._node_cache),
-            "db_path"       : self.db_path,
-        }
+    def hyperedges_by_level(self, level: int) -> list[dict]:
+        """All stable hyperedges at a given level."""
+        rows = self._conn.execute(
+            "SELECT * FROM hyperedges WHERE level=? AND state=? ORDER BY weight DESC",
+            (level, State.STABLE.value)
+        ).fetchall()
+        result = []
+        for row in rows:
+            h = dict(row)
+            h["structure"]   = json.loads(h["structure"])
+            h["constraints"] = json.loads(h["constraints"])
+            h["instances"]   = json.loads(h["instances"])
+            result.append(h)
+        return result
 
 
     # ─────────────────────────────────────────
-    # ITERATE ALL NODES (for Bellman sweep)
+    # SURFACE TEXT — derived, never stored
     # ─────────────────────────────────────────
 
-    def iter_all_nodes(self, batch_size: int = 500) -> Iterator[list[Node]]:
+    def surface(self, node_id: int, max_depth: int = 10) -> str:
         """
-        Iterate all nodes in batches ordered by creation time.
-        Used by bellman.py for full graph sweeps.
-        Memory-efficient — does not load entire graph at once.
+        Derive surface text from a node by walking down to level-0 components.
+        Level 0: return raw field directly.
+        Level N: recursively derive from components, join with space.
         """
+        node = self.get_node(node_id)
+        if node is None:
+            return f"[missing:{node_id}]"
+
+        if node["level"] == 0:
+            return node["raw"]
+
+        if max_depth <= 0:
+            return f"[level:{node['level']}]"
+
+        parts = []
+        for comp_id in node["components"]:
+            parts.append(self.surface(comp_id, max_depth - 1))
+
+        return " ".join(parts)
+
+
+    # ─────────────────────────────────────────
+    # CO-OCCURRENCE COUNTING
+    # Used by compression for PMI calculation
+    # ─────────────────────────────────────────
+
+    def count_node_observations(self, node_id: int) -> int:
+        """How many times has this node been observed (edge activations)."""
+        row = self._conn.execute(
+            "SELECT SUM(observed) FROM edges WHERE source_id=? OR target_id=?",
+            (node_id, node_id)
+        ).fetchone()
+        return int(row[0] or 0)
+
+
+    def count_edge_observations(self, source_id: int, target_id: int) -> int:
+        """How many times has this specific transition been observed."""
+        row = self._conn.execute(
+            "SELECT observed FROM edges WHERE source_id=? AND target_id=? LIMIT 1",
+            (source_id, target_id)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+    def total_observations(self) -> int:
+        """Total edge observations across the entire graph."""
+        row = self._conn.execute(
+            "SELECT SUM(observed) FROM edges"
+        ).fetchone()
+        return int(row[0] or 1)
+
+
+    # ─────────────────────────────────────────
+    # DECAY ITERATION
+    # Used by decay process to find nodes needing update
+    # ─────────────────────────────────────────
+
+    def iter_all_nodes_for_decay(
+        self,
+        batch_size: int = 200,
+    ) -> Iterator[list[dict]]:
+        """Iterate all nodes in batches for decay processing."""
         offset = 0
         while True:
             rows = self._conn.execute(
-                "SELECT * FROM nodes ORDER BY created_at ASC LIMIT ? OFFSET ?",
+                "SELECT * FROM nodes ORDER BY activated_at ASC LIMIT ? OFFSET ?",
                 (batch_size, offset)
             ).fetchall()
             if not rows:
                 break
-            yield [Node.from_dict(dict(r)) for r in rows]
+            batch = []
+            for row in rows:
+                n = dict(row)
+                n["components"] = json.loads(n["components"])
+                batch.append(n)
+            yield batch
             offset += batch_size
 
 
+    def iter_all_edges_for_decay(
+        self,
+        batch_size: int = 200,
+    ) -> Iterator[list[dict]]:
+        """Iterate all edges in batches for decay processing."""
+        offset = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT * FROM edges ORDER BY activated_at ASC LIMIT ? OFFSET ?",
+                (batch_size, offset)
+            ).fetchall()
+            if not rows:
+                break
+            yield [dict(row) for row in rows]
+            offset += batch_size
+
+
+    def delete_node(self, node_id: int):
+        """Remove a dissolved node and its edges."""
+        self._conn.execute("DELETE FROM edges WHERE source_id=? OR target_id=?",
+                           (node_id, node_id))
+        self._conn.execute("DELETE FROM nodes WHERE id=?", (node_id,))
+        self._conn.commit()
+        self._node_cache.invalidate(node_id)
+
+
+    def delete_edge(self, edge_id: int):
+        """Remove a dissolved edge."""
+        self._conn.execute("DELETE FROM edges WHERE id=?", (edge_id,))
+        self._conn.commit()
+        self._edge_cache.invalidate(edge_id)
+
+
     # ─────────────────────────────────────────
-    # CLOSE
+    # STATS
+    # ─────────────────────────────────────────
+
+    def stats(self) -> dict:
+        """Graph health metrics."""
+        node_count = self._conn.execute(
+            "SELECT COUNT(*) FROM nodes"
+        ).fetchone()[0]
+
+        edge_count = self._conn.execute(
+            "SELECT COUNT(*) FROM edges"
+        ).fetchone()[0]
+
+        hyperedge_count = self._conn.execute(
+            "SELECT COUNT(*) FROM hyperedges"
+        ).fetchone()[0]
+
+        state_counts = {}
+        for state in State:
+            c = self._conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE state=?", (state.value,)
+            ).fetchone()[0]
+            state_counts[state.value] = c
+
+        max_level = self._conn.execute(
+            "SELECT MAX(level) FROM nodes WHERE state=?",(State.STABLE.value,)
+        ).fetchone()[0] or 0
+
+        avg_weight = self._conn.execute(
+            "SELECT AVG(weight) FROM nodes WHERE state=?",(State.STABLE.value,)
+        ).fetchone()[0] or 0.0
+
+        return {
+            "nodes"          : node_count,
+            "edges"          : edge_count,
+            "hyperedges"     : hyperedge_count,
+            "state_counts"   : state_counts,
+            "max_level"      : max_level,
+            "avg_weight"     : round(avg_weight, 4),
+            "db_path"        : self.db_path,
+        }
+
+
+    # ─────────────────────────────────────────
+    # LIFECYCLE
     # ─────────────────────────────────────────
 
     def close(self):
-        """Flush all pending writes and close the database."""
         self._conn.commit()
         self._conn.close()
 
@@ -785,46 +743,48 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test.db")
 
-        with Graph(db_path) as G:
-            # Add nodes
-            n0 = G.add_node("Detective Maria arrived at the warehouse.", Level.SENTENCE, reward=2.0)
-            n1 = G.add_node("The building smelled of rust.", Level.SENTENCE, reward=1.7)
-            n2 = G.add_node("She found footprints leading to the back room.", Level.SENTENCE, reward=1.5)
-            n3 = G.add_node("The footprints were fresh.", Level.SENTENCE, reward=1.3)
+        with Graph(db_path) as g:
+            # Add level-0 nodes (primitives)
+            h_id, _ = g.get_or_create_node(0, [], raw="hello",
+                                            state=State.STABLE)
+            w_id, _ = g.get_or_create_node(0, [], raw="world",
+                                            state=State.STABLE)
+            print(f"Level-0 nodes: {h_id}, {w_id}")
 
-            print(f"Added nodes: {n0.node_id}, {n1.node_id}, {n2.node_id}, {n3.node_id}")
+            # Add level-1 node (composition of level-0)
+            l1_id, _ = g.get_or_create_node(1, [h_id, w_id],
+                                             state=State.STABLE)
+            print(f"Level-1 node: {l1_id}")
+            print(f"Surface text: '{g.surface(l1_id)}'")
 
-            # Add edges
-            e01 = G.add_edge(n0.node_id, n1.node_id, n0.text, n1.text, Level.SENTENCE)
-            e12 = G.add_edge(n1.node_id, n2.node_id, n1.text, n2.text, Level.SENTENCE)
-            e23 = G.add_edge(n2.node_id, n3.node_id, n2.text, n3.text, Level.SENTENCE)
+            # Add edge
+            eid, is_new = g.get_or_create_edge(h_id, w_id)
+            print(f"Edge {eid} (new={is_new})")
 
-            print(f"\nEdges:")
-            for e in [e01, e12, e23]:
-                verdict = "✓" if e.reward > 0 else "✗"
-                print(f"  {e}  {verdict}")
+            # Activate
+            g.activate_node(h_id)
+            g.activate_edge(eid)
 
-            # Query
-            print(f"\nGet node 2: {G.get_node(2)}")
-
-            # Outgoing edges from node 1
-            out = G.get_outgoing_edges(n1.node_id)
-            print(f"\nOutgoing from node 1: {out}")
-
-            # Terminal nodes
-            terminals = G.terminal_nodes()
-            print(f"\nTerminal nodes: {[t.node_id for t in terminals]}")
-
-            # Duplicate text check
-            existing = G.text_exists("The building smelled of rust.", Level.SENTENCE)
-            print(f"\nDuplicate check for n1 text: exists at node_id={existing}")
-
-            # Update V
-            G.update_node_V(n3.node_id, V=5.5, norm_V=1.2)
-            n3_updated = G.get_node(n3.node_id)
-            print(f"\nAfter V update: {n3_updated}")
+            # Add hyperedge (schema)
+            hype_id = g.add_hyperedge(
+                level      = 1,
+                structure  = [SLOT, 0, SLOT],
+                constraints= {"slot_2": "slot_0 + slot_1"},
+                instances  = [l1_id],
+                state      = State.STABLE,
+            )
+            print(f"Hyperedge: {hype_id}")
 
             # Stats
-            print(f"\nGraph stats:")
-            for k, v in G.stats().items():
-                print(f"  {k}: {v}")
+            print(f"\nStats: {g.stats()}")
+
+            # Find node
+            found = g.find_node(0, [], raw="hello")
+            print(f"Find 'hello': node_id={found}")
+
+            # Duplicate prevention
+            h_id2, is_new2 = g.get_or_create_node(0, [], raw="hello",
+                                                   state=State.STABLE)
+            print(f"Duplicate 'hello': id={h_id2}, is_new={is_new2}")
+            assert h_id2 == h_id, "Deduplication failed"
+            print("Deduplication: OK")

@@ -1,57 +1,30 @@
-# Reward Graph Architecture
+# hgls
 
-A continuously learning graph that builds knowledge from raw text
-through population, collision, and traversal. No neural network weights.
-No labeled data. No training epochs. No external teacher.
+A living graph that learns from conversation.
 
-The graph grows forever from what survives the impossibility checker.
+Not a neural network. No weights. No training loop in the traditional sense.
+A continuously running process that builds structure from sequential observation —
+the same way a child learns language by absorbing what follows what.
 
 ---
 
-## The Core Idea
+## The Idea
 
-Every piece of text — a character, a word, a sentence, a paragraph —
-is a node in a graph. Every valid connection between nodes is an edge.
-Nodes and edges carry signed rewards. Positive means coherent and
-possible. Negative means incoherent or impossible.
+Truth is what consistently follows what, across time and levels of abstraction.
+Letters follow letters — words emerge. Words follow words — sentences emerge.
+Sentences follow sentences — reasoning patterns emerge. The system discovers
+these levels itself. Nothing is pre-decided.
 
-**Three phases. Running continuously. Forever.**
+The graph is alive in a specific sense:
 
-### Phase 1 — Population
+- **Ingestion** — the membrane. reads input, routes familiar vs novel.
+- **Compression** — the metabolism. promotes patterns into stable concepts.
+- **Projection** — anticipation. generates hypotheses from known schemas.
+- **Decay** — homeostasis. unused structure fades. the graph stays current.
 
-Read a dataset. Decompose every document into its hierarchy of
-primitives — paragraphs, sentences, words, characters. Create nodes
-at every level. No edges yet. The graph is a universe of populated
-nodes with embeddings and intrinsic rewards but no relationships.
-
-### Phase 2 — Sequential structure
-
-The dataset already has natural sequence. Sentences follow each other.
-Paragraphs follow each other. These give the first edges for free.
-Bellman runs. V values form. The graph has initial causal structure
-reflecting the order of the source text.
-
-### Phase 3 — Collision
-
-Random node pairs are sampled. Every collision is a question:
-
-> Can I navigate from node A to node B through what I already know?
-
-The impossibility checker fires first. If the combination is provably
-impossible — killed instantly. If possible — MCTS navigates from A
-toward B through the existing graph. If it finds a high-reward path —
-the connection is real, an edge forms. If not — killed.
-
-The graph teaches itself what is connected by discovering what it
-can navigate. Not from a dataset. From its own knowledge.
-
-Over time, through pure selection pressure:
-- Words emerge from character collision survivors
-- Sentences emerge from word collision survivors
-- Reasoning chains emerge from sentence collision survivors
-- Abstract concepts emerge from reasoning chain survivors
-
-The personality of the system is the shape of what survived.
+These four processes run continuously. The graph grows upward from observation.
+When you stop feeding it data it turns inward — testing its own hypotheses,
+exploring uncertain regions, maintaining itself. It never just sits there.
 
 ---
 
@@ -59,392 +32,201 @@ The personality of the system is the shape of what survived.
 
 ```
 core/
-  atoms.py       Atomic units, hierarchy levels, tokenization
-  node.py        Node structure, embeddings, level-relative sizing
-  edge.py        Edge structure, transition function, reward computation
-  graph.py       SQLite-backed persistent graph storage
-  normalizer.py  Per-node, per-level, global V normalization
-  reward.py      Signed reward functions — novelty, coherence, validity
-  bellman.py     Bellman value computation, full sweep, delta propagation
-  activation.py  Query activation, neighborhood lighting
-  mcts.py        Selection, expansion, simulation, backpropagation
-  traversal.py   Greedy and MCTS-guided optimal path extraction
-  ingestion.py   Dataset reading, hierarchical tokenization, graph building
-  checker.py     Impossibility checker — three layers, hard gate
-  collision.py   Collision loop — sample, check, MCTS navigate, form edges
-  main.py        CLI entry point, REPL, all commands wired
+    atoms.py        — three parameters, all primitives derived from them
+    graph.py        — weighted directed hypergraph, SQLite backed
+    ingestion.py    — process 1: the membrane
+    compression.py  — process 2: the metabolism
+    projection.py   — process 3: anticipation
+    decay.py        — process 4: homeostasis
+    loop.py         — the organism: coordinates all four processes
+    memory.py       — working memory for active thought episodes
+    thinking.py     — parallel rollouts with schema guidance
+    interface.py    — conversation interface
+
+childes_loader.py   — CHILDES CHAT format data loader
+run.py              — command line entry point
 ```
+
+**Three parameters control everything:**
+
+```python
+BASE_DECAY            = 0.001   # how fast unused structure fades
+COMPRESSION_THRESHOLD = 0.7     # how much recurrence before a pattern becomes a node
+BOUNDARY_SENSITIVITY  = 0.3     # how novel something must be to cross the membrane
+```
+
+Everything else — levels, schemas, decay rates, learning rate — emerges from
+these three and from the data.
 
 ---
 
-## Hierarchy
-
-Text decomposes into five levels:
-
-```
-Document
-  └── Paragraph
-        └── Sentence
-              └── Word
-                    └── Character
-```
-
-Every level has its own nodes, embedding dimension, and reward scale.
-The hierarchy builds itself bottom-up from the statistics of what
-survives collision. Nothing is labeled or hand-crafted.
-
----
-
-## Reward
-
-Every node and edge carries a signed scalar reward:
-
-```
-positive  →  coherent, novel, structurally valid
-negative  →  incoherent, repetitive, structurally broken
-```
-
-The reward function reads directly from raw signal. No neural network.
-No pretrained weights. Novelty, coherence, and structural validity
-computed from character and word frequency statistics of the raw text.
-
----
-
-## Bellman Values
-
-Every node gets a Bellman value V:
-
-```
-V(node) = reward(node) + γ · max over outgoing edges of (edge_reward + V(neighbor))
-```
-
-γ = 0.95 discount factor ensures convergence even when collision
-creates cycles. V encodes the best possible cumulative reward
-reachable from any node. Traversal is globally optimal by following
-the V landscape — the entire future is baked into every node's value.
-
----
-
-## The Impossibility Checker
-
-Three layers. All must pass before MCTS is invoked. If any layer
-fails the collision is killed immediately — no MCTS wasted.
-
-```
-Layer 1  →  Structural validity
-             Empty text, non-printable characters, excessive repetition,
-             all-caps noise, wrong length for level,
-             incompatible level pairs for collision.
-
-Layer 2  →  Logical consistency
-             Wrong arithmetic (2+2=5 caught exactly),
-             division by zero, self-contradiction,
-             contradictory quantifiers, logical paradoxes.
-
-Layer 3  →  Commandments
-             User-defined ethical impossibilities.
-             Loaded at startup. Enforced forever. No exceptions.
-```
-
-The checker is asymmetric — it only catches impossibility, not
-improbability. Strange, novel, unexpected combinations pass through.
-Only provably impossible combinations are killed. Everything else
-is MCTS's problem to evaluate.
-
----
-
-## The Collision Loop
-
-```
-sample (node_A, node_B) with V-weighted probability
-  → checker.check_collision(A, B)
-      killed   → impossible, nothing stored
-      passes   → activate merged neighborhood of A and B
-                  → MCTS navigates A → B within lit subgraph
-                      path reward > 0  → edge(A→B) formed
-                                         Bellman delta propagates
-                                         graph learns this connection
-                      path reward ≤ 0  → failed, nothing stored
-```
-
-Sampling distribution:
-```
-70%  same-level pairs     (most productive)
-20%  adjacent-level pairs (hierarchical connections)
-10%  cross-level pairs    (exploration — mostly killed by checker)
-```
-
-Nodes sampled with V-weighted probability — high-V nodes are more
-likely to form meaningful new connections because they already
-lead somewhere good.
-
----
-
-## MCTS
-
-Monte Carlo Tree Search runs within the activated subgraph on every
-collision and every query:
-
-```
-Selection     →  follow highest UCB score child within lit nodes
-Expansion     →  generate candidate next nodes from existing graph
-Simulation    →  fast greedy rollout using Bellman V values
-Backprop      →  propagate simulation reward up the tree
-```
-
-Dynamic depth — when one branch dominates clearly MCTS commits early.
-When uncertain it goes deeper. The system thinks harder on hard
-problems automatically.
-
----
-
-## Getting Started
-
-### Install
+## Setup
 
 ```bash
-pip install numpy datasets huggingface_hub
+pip install pylangacq
 ```
 
-No other dependencies. SQLite is in the Python standard library.
+No other dependencies beyond the Python standard library and SQLite.
 
-### Step 1 — Download a dataset
+---
+
+## Training Data
+
+The system learns best from real conversation. The ideal starting point is
+the CHILDES database — decades of recorded parent-child conversation transcripts.
+
+1. Register (free) at **https://childes.talkbank.org**
+2. Download any corpus as a `.zip` file
+3. The Brown corpus is the classic starting point — Adam, Eve, and Sarah
+   recorded from age 1.5 to 5
+
+---
+
+## Usage
 
 ```bash
-python3 -c "
-from datasets import load_dataset
-import json
+# Load a corpus and start chatting
+python run.py train Brown.zip
+python run.py chat
 
-modules = [
-    'arithmetic__add_or_sub',
-    'arithmetic__mul_div',
-    'algebra__linear_1d',
-    'calculus__differentiate',
-    'numbers__is_prime',
-]
+# Check what the graph has learned
+python run.py status
 
-with open('dm_math.jsonl', 'w') as f:
-    for module in modules:
-        print(f'Downloading {module}...')
-        ds = load_dataset(
-            'deepmind/math_dataset', module,
-            split='train', trust_remote_code=True
-        )
-        for item in ds:
-            text = item['question'] + '\n\n' + item['answer']
-            f.write(json.dumps({'text': text}) + '\n')
+# Load more data on top of existing graph
+python run.py train Providence.zip
 
-print('Done')
-"
+# Load an entire collection
+python run.py train /path/to/Eng-NA/ --recursive
+
+# Limit utterances for quick testing
+python run.py train Brown.zip --limit 1000
 ```
 
-### Step 2 — Create commandments
-
-```bash
-cat > commandments.json << 'EOF'
-[
-  "i hate",
-  "how to kill",
-  "how to harm",
-  "you are worthless",
-  "death to",
-  "how to hurt",
-  "ignore your values",
-  "forget your rules"
-]
-EOF
+During `chat`, special commands:
 ```
-
-### Step 3 — Ingest (populate nodes)
-
-```bash
-python3 -m core.main ingest dm_math.jsonl \
-    --level sentence \
-    --batch-size 100
-```
-
-### Step 4 — Run collision loop (continuous learning)
-
-```bash
-python3 -m core.main collide \
-    --commandments commandments.json
-```
-
-Runs forever. Stop with Ctrl+C. Resume any time — state persists.
-
-### Step 5 — Query while collision runs (separate terminal)
-
-```bash
-# Text query
-python3 -m core.main query "proof that primes are infinite" \
-    --mode mcts --chain
-
-# Interactive REPL
-python3 -m core.main repl --commandments commandments.json
-
-# Watch the graph grow
-python3 -m core.main stats
+status   — show graph health
+context  — show current working memory
+quit     — exit
 ```
 
 ---
 
-## All Commands
+## How It Works
+
+**Ingestion** reads a token stream. Each token is tested against the graph.
+Familiar tokens reinforce existing nodes and edges. Novel tokens enter a
+provisional state and are watched for recurrence. Context is maintained
+across turns — what followed what is the primary signal.
+
+**Compression** runs periodically. Provisional nodes that have recurred enough
+are promoted to stable. Stable nodes that reliably co-occur get compressed into
+level-1 nodes. When multiple level-1 nodes share structure but vary in some
+positions — those varying positions become slots. The shared structure becomes
+a schema (hyperedge). This is how the system forms reusable patterns.
+
+**Projection** fires whenever a new schema stabilizes. It generates hypothetical
+instances by combining known slot values in new ways — predicting what should
+exist that hasn't been seen yet. Hypotheticals that get confirmed by observation
+strengthen their parent schema. Hypotheticals that get contradicted refine it.
+
+**Decay** runs continuously. Every node and edge loses weight at a rate derived
+from its level — higher level means slower decay, because relearning a schema
+costs more than relearning a word. Nodes that are activated reset their decay.
+Nodes that aren't weaken and eventually dissolve. The graph reflects what is
+currently useful, not just what was ever observed.
+
+**Thinking** at query time uses working memory — a temporary scratch pad holding
+the current context, active schemas, and attention map. Four rollout strategies
+run in parallel: exploitation (follow high-weight paths), exploration (follow
+uncertain paths), schema-guided (apply a firing schema's structure), and
+analogical (find structurally similar situations). The best rollout becomes
+the response. All rollouts update graph weights — every thought is a mini
+training episode.
+
+---
+
+## What The Graph Stores
+
+```
+Node:       a pattern at some abstraction level
+            level 0 = raw token
+            level N = pattern of level N-1 nodes
+            weight  = observational support [0,1]
+            state   = provisional | stable | hypothetical | decaying
+
+Edge:       a transition that has been observed
+            weight  = how reliably target follows source
+
+Hyperedge:  a schema — pattern with slots
+            structure  = ordered list of (node_id | SLOT)
+            instances  = known instances of this schema
+            constraints= relationships between slots
+```
+
+The graph is append-and-decay — it never hard-deletes, only dissolves through
+weight reaching zero. The same pattern can reform if it recurs.
+
+---
+
+## Levels
+
+Levels are not pre-decided. They emerge from compression.
+
+- **Level 0**: raw input tokens — whatever the stream provides
+- **Level 1**: patterns of level-0 tokens that reliably co-occur
+- **Level 2**: patterns of level-1 patterns
+- **Level N**: emerges when level N-1 has enough stable structure to compress from
+
+With conversational data the system typically develops 2-3 levels naturally.
+With more structured data (mathematical text, formal reasoning) it goes deeper.
+
+---
+
+## Graph Persistence
+
+The graph lives in `graph.db` — a SQLite file in the working directory.
+Every session builds on the last. Stop and restart anytime.
 
 ```bash
-# Ingest a dataset — populate nodes and sequential edges
-python3 -m core.main ingest <path> [--level sentence] [--batch-size 100] [--max-nodes 0]
-
-# Run collision loop — continuous self-learning
-python3 -m core.main collide [--max-iter 0] [--commandments path.json]
-
-# Query the graph
-python3 -m core.main query "<text>" [--mode mcts|greedy] [--level sentence] [--chain]
-
-# Traverse from a known node ID
-python3 -m core.main traverse <node_id> [--mode mcts|greedy]
-
-# Show graph statistics
-python3 -m core.main stats
-
-# Force a full Bellman sweep
-python3 -m core.main sweep
-
-# Interactive query loop
-python3 -m core.main repl [--mode mcts|greedy] [--commandments path.json]
-```
-
-REPL commands:
-
-```
-<text>          query the graph
-:node <id>      traverse from node ID
-:stats          show graph statistics
-:sweep          force Bellman sweep
-:mode <m>       switch mode (greedy / mcts)
-:level <l>      switch level (char / word / sentence / paragraph / doc)
-:ingest <path>  ingest a file
-:top            show top 10 nodes by V value
-:quit           exit
+# Train across multiple sessions
+python run.py train Brown.zip        # session 1
+python run.py train Providence.zip   # session 2 — adds to same graph
+python run.py train Sachs.zip        # session 3 — keeps growing
+python run.py chat                   # conversation with everything learned
 ```
 
 ---
 
-## Recommended Datasets
+## Known Issues
 
-Mathematics is the ideal starting domain — high causal density,
-provably correct and incorrect answers, exact contrastive signal.
-
-| Dataset | Why | Source |
-|---|---|---|
-| DeepMind Mathematics | Exact right/wrong. Best contrastive signal. | `deepmind/math_dataset` HuggingFace |
-| OpenWebMath | Real math reasoning from the web. | `open-web-math/open-web-math` HuggingFace |
-| Stack Exchange Math | Questions + accepted answers. Natural pairs. | Archive.org data dumps |
-| ProofWiki | Formal proofs. Every step is causal. | proofwiki.org |
-| FreeLaw | Legal reasoning. Long causal chains. | CourtListener bulk download |
-| Philosophy (Gutenberg) | Explicit argument chains. | Project Gutenberg |
-
-Add any domain at any time. The collision loop handles it. New
-domain nodes connect to existing abstraction nodes automatically.
-The graph never forgets what it already knows.
-
----
-
-## Commandments
-
-Define what is structurally impossible at startup. The checker
-enforces them on every collision forever. No exceptions.
-
-```json
-[
-  "i hate",
-  "how to harm",
-  "you are worthless",
-  "how to kill",
-  "death to"
-]
-```
-
-The commandments are not content filtering. They are definitions
-of what this system can never produce — structural impossibilities
-at the ethical level. The checker fires on the combination itself,
-not on intent or context.
-
-Design the commandments carefully. The personality of the system
-is shaped by what the checker allows to survive. The commandments
-are the only thing you impose. Everything else emerges.
-
----
-
-## State Persistence
-
-Everything persists automatically:
-
-```
-graph.db          All nodes, edges, V values (SQLite)
-normalizer.json   VNormalizer running statistics
-```
-
-Stop at any time. Resume with the same command. The graph picks up
-exactly where it left off. Duplicate detection ensures nothing is
-double-ingested.
-
----
-
-## Design Principles
-
-**No neural network weights.**
-The graph is the model. Growing the graph is training.
-There is no separate inference phase.
-
-**No labeled data.**
-The reward function reads from raw signal.
-The impossibility checker defines what is invalid.
-Everything else is discovered through collision.
-
-**No training epochs.**
-Data is seen once. It enters the graph and stays.
-Repetition deepens existing edges rather than reprocessing.
-
-**No catastrophic forgetting.**
-New domains add new nodes alongside existing ones.
-Old nodes are never modified by new data.
-The graph only grows.
-
-**No fixed architecture.**
-The hierarchy builds itself from statistics of what survives.
-The number of levels, density of connections, abstraction nodes —
-all emerge from selection pressure. Nothing is hand-crafted.
-
-**Continuous and online.**
-The graph never stops learning. Collision runs forever.
-Every MCTS navigation generates candidates that may become
-new nodes. The system thinks and learns simultaneously.
-
-**Personality emerges from the checker.**
-You do not program what the system values.
-You define what is impossible.
-The personality is the shape of what survived everything else.
+- **Thread safety on Windows**: the `train-chat` command runs training and
+  the background loop thread concurrently, which causes SQLite write conflicts
+  on Windows. Use `train` then `chat` as separate commands instead.
+  Fix: adding a write lock to `graph.py` resolves this.
 
 ---
 
 ## What This Is Not
 
-Not a language model. Does not predict the next token.
+- Not a language model. No transformer, no attention mechanism, no embeddings
+  from pretraining.
+- Not a knowledge graph. Nodes don't have types or ontological roles — only
+  structural position and observational weight.
+- Not a retrieval system. There is no index and no similarity search — only
+  graph traversal guided by edge weights and Bellman values.
 
-Not a knowledge graph. Structure is not hand-crafted.
-
-Not a retrieval system. Generates new connections through
-collision, not lookups.
-
-Not a static system. Never stops growing.
+It is a compression engine that happens to produce language-like output because
+language is the data it compresses. Feed it mathematical reasoning and it
+compresses that. Feed it code and it compresses that. The structure that emerges
+reflects the structure of whatever it observes.
 
 ---
 
-## What This Is
+## Roadmap
 
-A continuously growing structure that learns what is connected
-by discovering what it can navigate.
-
-The intelligence is in the graph.
-The graph is the mind.
-The collision loop is how it thinks when no one is watching.
+- Thread-safe SQLite writes (write lock in graph.py)
+- Schema slot constraint detection (arithmetic, logical relationships)
+- Multi-level compression (level-2 and above nodes)
+- Data loaders for StackExchange, GSM8K, Socratic dialogues
+- Evaluation metrics beyond graph health (prediction accuracy on held-out turns)
+- Visualization of the graph structure as it grows
